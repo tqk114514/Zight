@@ -1,6 +1,6 @@
 //! high-level 共享读取层：loose + pack fallback + delta 链递归解析。
 //!
-//! 职责（§2.4）：给调用方提供统一的 `readObject(oid) -> Object` 接口，
+//! 职责（§2.4）：给调用方提供统一的 `readObject(allocator, oid) -> Object` 接口，
 //! 内部先查 loose（object.zig），再查所有 packfile（pack.zig），
 //! 对 delta 对象递归解析 base 并应用 delta（delta.zig）。
 //! delta 链深度上限由 `Limits.delta_depth_max` 约束（§5.2）。
@@ -69,12 +69,13 @@ pub const Reader = struct {
     }
 
     /// 读取 `oid` 对应的对象。先查 loose，再查所有 pack。
-    pub fn readObject(self: *Reader, oid: Oid) ZightError!Object {
-        return self.readObjectInternal(oid, 0);
+    /// `allocator` 决定返回 `Object.buf` 的分配，调用方须用同一 `allocator` 调 `deinit`。
+    pub fn readObject(self: *Reader, allocator: Allocator, oid: Oid) ZightError!Object {
+        return self.readObjectInternal(allocator, oid, 0);
     }
 
-    fn readObjectInternal(self: *Reader, oid: Oid, depth: u32) ZightError!Object {
-        if (object.readLoose(self.repo, oid)) |obj| {
+    fn readObjectInternal(self: *Reader, allocator: Allocator, oid: Oid, depth: u32) ZightError!Object {
+        if (object.readLoose(self.repo, allocator, oid)) |obj| {
             return obj;
         } else |err| switch (err) {
             error.NotFound => {},
@@ -83,17 +84,17 @@ pub const Reader = struct {
 
         for (self.packs) |*pk| {
             if (pk.findOffset(oid)) |offset| {
-                return self.resolvePackObject(pk, offset, depth);
+                return self.resolvePackObject(allocator, pk, offset, depth);
             }
         }
 
         return error.NotFound;
     }
 
-    fn resolvePackObject(self: *Reader, pk: *Pack, offset: u64, depth: u32) ZightError!Object {
+    fn resolvePackObject(self: *Reader, allocator: Allocator, pk: *Pack, offset: u64, depth: u32) ZightError!Object {
         if (depth >= self.repo.limits.delta_depth_max) return error.LimitExceeded;
 
-        var raw = pk.readRaw(self.repo.allocator, offset) catch |err| return mapPackError(err);
+        var raw = pk.readRaw(allocator, offset) catch |err| return mapPackError(err);
 
         if (!raw.isDelta()) {
             const obj_type: ObjectType = switch (raw.type) {
@@ -110,18 +111,18 @@ pub const Reader = struct {
             };
         }
 
-        defer self.repo.allocator.free(raw.data);
+        defer allocator.free(raw.data);
 
         var base_obj: Object = if (raw.base_offset) |bo|
-            try self.resolvePackObject(pk, bo, depth + 1)
+            try self.resolvePackObject(allocator, pk, bo, depth + 1)
         else if (raw.base_oid) |boid|
-            try self.readObjectInternal(boid, depth + 1)
+            try self.readObjectInternal(allocator, boid, depth + 1)
         else
             return error.MalformedObject;
-        defer base_obj.deinit(self.repo.allocator);
+        defer base_obj.deinit(allocator);
 
         const target = delta.applyDelta(
-            self.repo.allocator,
+            allocator,
             base_obj.content,
             raw.data,
             self.repo.limits.packfile_object_max,
@@ -155,7 +156,7 @@ pub const Reader = struct {
     /// 读取 commit 对象并解析其 `tree` 字段 oid。
     /// `commit_oid` 必须指向 commit 对象，否则返回 `MalformedObject`。
     pub fn commitTree(self: *Reader, allocator: Allocator, commit_oid: Oid) ZightError!Oid {
-        var obj = try self.readObject(commit_oid);
+        var obj = try self.readObject(allocator, commit_oid);
         defer obj.deinit(allocator);
         if (obj.type != .commit) return error.MalformedObject;
         if (!std.mem.startsWith(u8, obj.content, "tree ")) return error.MalformedObject;
@@ -166,7 +167,7 @@ pub const Reader = struct {
     /// 读取 commit 对象并解析其首个 `parent` 字段 oid。
     /// 无 parent（根 commit）返回 `null`。
     pub fn firstParent(self: *Reader, allocator: Allocator, commit_oid: Oid) ZightError!?Oid {
-        var obj = try self.readObject(commit_oid);
+        var obj = try self.readObject(allocator, commit_oid);
         defer obj.deinit(allocator);
         if (obj.type != .commit) return error.MalformedObject;
         var it = std.mem.splitScalar(u8, obj.content, '\n');
@@ -183,7 +184,7 @@ pub const Reader = struct {
     /// `parents` 由调用方拥有，须 `deinit` 释放。比分别 `commitTree`+`firstParent`
     /// 少一次 commit 读取。
     pub fn commitMeta(self: *Reader, allocator: Allocator, commit_oid: Oid) ZightError!CommitMeta {
-        var obj = try self.readObject(commit_oid);
+        var obj = try self.readObject(allocator, commit_oid);
         defer obj.deinit(allocator);
         if (obj.type != .commit) return error.MalformedObject;
         return parseCommitMeta(allocator, obj.content);
@@ -195,7 +196,7 @@ pub const Reader = struct {
         var current = oid;
         var depth: u32 = 0;
         while (depth < 10) : (depth += 1) {
-            var obj = try self.readObject(current);
+            var obj = try self.readObject(allocator, current);
             defer obj.deinit(allocator);
             switch (obj.type) {
                 .commit => return current,
@@ -302,7 +303,7 @@ test "Reader.readObject loose commit" {
     defer reader.close();
 
     const oid = try headOid(&repo);
-    var obj = try reader.readObject(oid);
+    var obj = try reader.readObject(testing.allocator, oid);
     defer obj.deinit(testing.allocator);
 
     try testing.expectEqual(ObjectType.commit, obj.type);
@@ -316,7 +317,7 @@ test "Reader.readObject packed commit" {
     defer reader.close();
 
     const oid = try headOid(&repo);
-    var obj = try reader.readObject(oid);
+    var obj = try reader.readObject(testing.allocator, oid);
     defer obj.deinit(testing.allocator);
 
     try testing.expectEqual(ObjectType.commit, obj.type);
@@ -336,7 +337,7 @@ test "Reader.readObject all packed objects (OFS_DELTA)" {
         var sha: [20]u8 = undefined;
         @memcpy(&sha, pk.idx.shas[i * 20 ..][0..20]);
         const oid = Oid{ .bytes = sha };
-        var obj = try reader.readObject(oid);
+        var obj = try reader.readObject(testing.allocator, oid);
         defer obj.deinit(testing.allocator);
         try testing.expect(obj.content.len > 0 or obj.type == .blob);
     }
@@ -355,7 +356,7 @@ test "Reader.readObject all packed-ref objects (REF_DELTA)" {
         var sha: [20]u8 = undefined;
         @memcpy(&sha, pk.idx.shas[i * 20 ..][0..20]);
         const oid = Oid{ .bytes = sha };
-        var obj = try reader.readObject(oid);
+        var obj = try reader.readObject(testing.allocator, oid);
         defer obj.deinit(testing.allocator);
         try testing.expect(obj.content.len > 0 or obj.type == .blob);
     }
@@ -368,7 +369,7 @@ test "Reader.readObject missing returns NotFound" {
     defer reader.close();
 
     const zero = Oid.fromHex("0000000000000000000000000000000000000000") catch unreachable;
-    try testing.expectError(error.NotFound, reader.readObject(zero));
+    try testing.expectError(error.NotFound, reader.readObject(testing.allocator, zero));
 }
 
 test "Reader.open empty fixture (no packs)" {

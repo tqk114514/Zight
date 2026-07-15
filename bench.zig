@@ -48,10 +48,10 @@ pub fn main() !void {
 
     // 1. 单个小对象读取（warm）：读 HEAD commit 两次，计时第二次。
     {
-        var o1 = try reader.readObject(head_oid);
+        var o1 = try reader.readObject(allocator, head_oid);
         o1.deinit(allocator);
         const start = nowTs(io);
-        var o2 = try reader.readObject(head_oid);
+        var o2 = try reader.readObject(allocator, head_oid);
         const elapsed = elapsedMs(io, start);
         o2.deinit(allocator);
         std.debug.print("1. object read (warm, HEAD commit): {d:.3} ms  [target <1ms]\n", .{elapsed});
@@ -79,10 +79,10 @@ pub fn main() !void {
 
         // 首屏：root tree 读取（warm）
         {
-            var t1 = try reader.readObject(root_tree);
+            var t1 = try reader.readObject(allocator, root_tree);
             t1.deinit(allocator);
             const start = nowTs(io);
-            var t2 = try reader.readObject(root_tree);
+            var t2 = try reader.readObject(allocator, root_tree);
             const elapsed = elapsedMs(io, start);
             t2.deinit(allocator);
             std.debug.print("3a. tree first-screen (root tree read, warm): {d:.3} ms  [target <50ms]\n", .{elapsed});

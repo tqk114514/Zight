@@ -70,7 +70,7 @@ pub const TreeWalker = struct {
     }
 
     fn pushTree(self: *TreeWalker, oid: Oid, base_len: usize) ZightError!void {
-        var obj = try self.reader.readObject(oid);
+        var obj = try self.reader.readObject(self.allocator, oid);
         errdefer obj.deinit(self.allocator);
         if (obj.type != .tree) return error.MalformedObject;
         const buf = obj.buf;
@@ -177,7 +177,7 @@ fn openFixture(name: []const u8) !Repo {
 /// 从 HEAD 解析 commit，取其 tree oid。
 fn headTree(repo: *Repo, rdr: *Reader) !Oid {
     const tip = try ref.resolveHead(repo);
-    var obj = try rdr.readObject(tip);
+    var obj = try rdr.readObject(testing.allocator, tip);
     defer obj.deinit(testing.allocator);
     const nl = std.mem.indexOfScalar(u8, obj.content, '\n') orelse return error.MalformedObject;
     const line = obj.content[0..nl];
@@ -309,7 +309,7 @@ test "findFile locates nested file" {
 
     const root = try headTree(&repo, &rdr);
     const oid = (try findFile(testing.allocator, &rdr, root, "src/nested.txt")).?;
-    var obj = try rdr.readObject(oid);
+    var obj = try rdr.readObject(testing.allocator, oid);
     defer obj.deinit(testing.allocator);
     try testing.expectEqualStrings("nested file\n", obj.content);
 }

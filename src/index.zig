@@ -143,22 +143,28 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
         stack.append(allocator, commit_oid) catch return error.OutOfMemory;
     }
 
+    // 临时数据（commit 内容、tree diff buf、paths）用 arena，每轮循环末尾 reset；
+    // 永久数据（parents、bloom.bits）用主 allocator，保留到 serializeBuffer。
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
     while (stack.items.len > 0) {
         const oid = stack.items[stack.items.len - 1];
         stack.items.len -= 1;
 
-        var meta = try reader.commitMeta(allocator, oid);
-        errdefer meta.deinit(allocator);
+        const arena_alloc = arena.allocator();
+        const meta = try reader.commitMeta(arena_alloc, oid);
+        const parents = try allocator.dupe(Oid, meta.parents);
+        errdefer allocator.free(parents);
 
-        var bl: Bloom = if (meta.parents.len > 0) blk: {
-            const parent_tree = try reader.commitTree(allocator, meta.parents[0]);
-            const paths = try collectChangedPaths(allocator, reader, parent_tree, meta.tree);
-            defer freePaths(allocator, paths);
+        var bl: Bloom = if (parents.len > 0) blk: {
+            const parent_tree = try reader.commitTree(arena_alloc, parents[0]);
+            const paths = try collectChangedPaths(arena_alloc, reader, parent_tree, meta.tree);
             break :blk try bloom_mod.build(allocator, paths);
         } else .{ .bits = &.{}, .bit_count = 0 };
         errdefer bl.deinit(allocator);
 
-        for (meta.parents) |p| {
+        for (parents) |p| {
             if (visited.contains(p.bytes)) continue;
             visited.put(p.bytes, {}) catch return error.OutOfMemory;
             stack.append(allocator, p) catch return error.OutOfMemory;
@@ -168,11 +174,12 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
             .oid = oid,
             .tree = meta.tree,
             .committer_time = meta.committer_time,
-            .parents = meta.parents,
+            .parents = parents,
             .bloom = bl,
         }) catch return error.OutOfMemory;
-        meta.parents = &.{};
         bl = .{ .bits = &.{}, .bit_count = 0 };
+
+        _ = arena.reset(.free_all);
     }
 
     std.mem.sort(BuildEntry, entries.items, {}, buildEntryOidLessThan);
@@ -270,11 +277,6 @@ fn collectChangedPaths(allocator: Allocator, reader: *Reader, old_tree: Oid, new
         };
     }
     return paths.toOwnedSlice(allocator) catch return error.OutOfMemory;
-}
-
-fn freePaths(allocator: Allocator, paths: [][]u8) void {
-    for (paths) |p| allocator.free(p);
-    allocator.free(paths);
 }
 
 fn buildEntryOidLessThan(_: void, a: BuildEntry, b: BuildEntry) bool {

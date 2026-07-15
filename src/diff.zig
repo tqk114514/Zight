@@ -83,7 +83,7 @@ pub const TreeDiff = struct {
         }
 
         if (old_tree) |oid| {
-            var obj = try self.reader.readObject(oid);
+            var obj = try self.reader.readObject(self.allocator, oid);
             if (obj.type != .tree) {
                 obj.deinit(self.allocator);
                 return error.MalformedObject;
@@ -94,7 +94,7 @@ pub const TreeDiff = struct {
             obj.content = &.{};
         }
         if (new_tree) |oid| {
-            var obj = try self.reader.readObject(oid);
+            var obj = try self.reader.readObject(self.allocator, oid);
             if (obj.type != .tree) {
                 obj.deinit(self.allocator);
                 return error.MalformedObject;
@@ -220,11 +220,11 @@ pub const TreeDiff = struct {
 
 /// 读取两个 blob 并计算行级 diff。调用方拥有返回切片。
 pub fn diffBlobLines(allocator: Allocator, reader: *Reader, old_oid: Oid, new_oid: Oid) ZightError![]DiffOp {
-    var old_obj = try reader.readObject(old_oid);
+    var old_obj = try reader.readObject(allocator, old_oid);
     defer old_obj.deinit(allocator);
     if (old_obj.type != .blob) return error.MalformedObject;
 
-    var new_obj = try reader.readObject(new_oid);
+    var new_obj = try reader.readObject(allocator, new_oid);
     defer new_obj.deinit(allocator);
     if (new_obj.type != .blob) return error.MalformedObject;
 

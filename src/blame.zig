@@ -46,7 +46,7 @@ pub fn blameAt(allocator: Allocator, reader: *Reader, index: ?*const Index, comm
     const tree = try reader.commitTree(allocator, commit_oid);
     const blob_oid = (try tree_browse.findFile(allocator, reader, tree, path)) orelse return error.NotFound;
 
-    var blob_obj = try reader.readObject(blob_oid);
+    var blob_obj = try reader.readObject(allocator, blob_oid);
     defer blob_obj.deinit(allocator);
     if (blob_obj.type != .blob) return error.MalformedObject;
 
@@ -93,9 +93,9 @@ pub fn blameAt(allocator: Allocator, reader: *Reader, index: ?*const Index, comm
             continue;
         }
 
-        var cur_obj = try reader.readObject(cur_blob_oid);
+        var cur_obj = try reader.readObject(allocator, cur_blob_oid);
         defer cur_obj.deinit(allocator);
-        var parent_obj = try reader.readObject(parent_blob_oid);
+        var parent_obj = try reader.readObject(allocator, parent_blob_oid);
         defer parent_obj.deinit(allocator);
 
         const cur_lines = try line_diff.splitLines(allocator, cur_obj.content);

@@ -111,7 +111,7 @@ pub const Log = struct {
         try self.visited.put(oid.bytes, {});
         errdefer _ = self.visited.remove(oid.bytes);
 
-        var obj = self.reader.readObject(oid) catch |err| switch (err) {
+        var obj = self.reader.readObject(self.allocator, oid) catch |err| switch (err) {
             error.NotFound => return,
             else => |e| return e,
         };

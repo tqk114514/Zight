@@ -5,6 +5,7 @@
 //! 不匹配返回 `CorruptedObject` 且不返回部分数据（§4.3）。
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const hash = @import("hash.zig");
 const Oid = hash.Oid;
@@ -47,7 +48,7 @@ pub const Object = struct {
 ///
 /// 路径：`objects/<2hex>/<38hex>`。解压大小受 `limits.loose_object_max` 约束（§5.2）。
 /// 解压后重算 SHA-1，与 `oid` 不匹配返回 `error.CorruptedObject`。
-pub fn readLoose(repo: *Repo, oid: Oid) ZightError!Object {
+pub fn readLoose(repo: *Repo, allocator: Allocator, oid: Oid) ZightError!Object {
     var path_buf: [64]u8 = undefined;
     const path = try loosePath(&path_buf, oid);
 
@@ -59,18 +60,18 @@ pub fn readLoose(repo: *Repo, oid: Oid) ZightError!Object {
     defer repo.allocator.free(compressed);
 
     const limit = std.Io.Limit.limited(repo.limits.loose_object_max);
-    const decompressed = zlib.decompress(repo.allocator, compressed, limit) catch |err| switch (err) {
+    const decompressed = zlib.decompress(allocator, compressed, limit) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return error.LimitExceeded,
         else => return error.CorruptedObject,
     };
-    errdefer repo.allocator.free(decompressed);
+    errdefer allocator.free(decompressed);
 
     var content: []u8 = undefined;
     const obj_type = try parseHeader(decompressed, &content);
 
     if (!verifyHash(decompressed, oid)) {
-        repo.allocator.free(decompressed);
+        allocator.free(decompressed);
         return error.CorruptedObject;
     }
 
@@ -135,7 +136,7 @@ test "readLoose HEAD commit" {
     var repo = try openFixture("tiny");
     defer repo.close();
     const oid = try headOid(&repo);
-    var obj = try readLoose(&repo, oid);
+    var obj = try readLoose(&repo, testing.allocator, oid);
     defer obj.deinit(testing.allocator);
     try std.testing.expectEqual(ObjectType.commit, obj.type);
     try std.testing.expect(std.mem.startsWith(u8, obj.content, "tree "));
@@ -145,7 +146,7 @@ test "readLoose missing returns NotFound" {
     var repo = try openFixture("tiny");
     defer repo.close();
     const oid = Oid.fromHex("0000000000000000000000000000000000000000") catch unreachable;
-    try std.testing.expectError(error.NotFound, readLoose(&repo, oid));
+    try std.testing.expectError(error.NotFound, readLoose(&repo, testing.allocator, oid));
 }
 
 test "readLoose returns LimitExceeded when compressed file exceeds limit" {
@@ -155,7 +156,7 @@ test "readLoose returns LimitExceeded when compressed file exceeds limit" {
     defer repo.close();
     repo.limits.loose_object_max = 10;
     const oid = try headOid(&repo);
-    try std.testing.expectError(error.LimitExceeded, readLoose(&repo, oid));
+    try std.testing.expectError(error.LimitExceeded, readLoose(&repo, testing.allocator, oid));
 }
 
 test "loosePath format" {
