@@ -40,6 +40,11 @@ pub const diffBlobLines = @import("diff.zig").diffBlobLines;
 pub const blame = @import("blame.zig");
 pub const Blame = @import("blame.zig").Blame;
 pub const blameAt = @import("blame.zig").blameAt;
+pub const bloom = @import("bloom.zig");
+pub const Bloom = @import("bloom.zig").Bloom;
+pub const index = @import("index.zig");
+pub const Index = @import("index.zig").Index;
+pub const CommitRecord = @import("index.zig").CommitRecord;
 
 test {
     _ = @import("error.zig");
@@ -57,4 +62,6 @@ test {
     _ = @import("line_diff.zig");
     _ = @import("diff.zig");
     _ = @import("blame.zig");
+    _ = @import("bloom.zig");
+    _ = @import("index.zig");
 }

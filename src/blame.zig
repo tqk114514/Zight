@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const Oid = @import("hash.zig").Oid;
 const Reader = @import("reader.zig").Reader;
 const Repo = @import("repo.zig").Repo;
+const Index = @import("index.zig").Index;
 const ZightError = @import("error.zig").ZightError;
 const tree_browse = @import("tree_browse.zig");
 const line_diff = @import("line_diff.zig");
@@ -32,14 +33,16 @@ pub const Blame = struct {
 };
 
 /// 对 HEAD 中的 `path` 文件做 blame。
-pub fn blame(allocator: Allocator, reader: *Reader, path: []const u8) ZightError!Blame {
+/// `index` 非空时用 Bloom filter 跳过未改路径的 tree 读取（§6.3）。
+pub fn blame(allocator: Allocator, reader: *Reader, index: ?*const Index, path: []const u8) ZightError!Blame {
     const head = try ref.resolveHead(reader.repo);
-    return blameAt(allocator, reader, head, path);
+    return blameAt(allocator, reader, index, head, path);
 }
 
 /// 对 `commit_oid` 中的 `path` 文件做 blame。
+/// `index` 非空时用 Bloom filter 跳过未改路径的 tree 读取（§6.3）。
 /// 文件不存在返回 `NotFound`；对象类型非 blob 返回 `MalformedObject`。
-pub fn blameAt(allocator: Allocator, reader: *Reader, commit_oid: Oid, path: []const u8) ZightError!Blame {
+pub fn blameAt(allocator: Allocator, reader: *Reader, index: ?*const Index, commit_oid: Oid, path: []const u8) ZightError!Blame {
     const tree = try reader.commitTree(allocator, commit_oid);
     const blob_oid = (try tree_browse.findFile(allocator, reader, tree, path)) orelse return error.NotFound;
 
@@ -65,6 +68,15 @@ pub fn blameAt(allocator: Allocator, reader: *Reader, commit_oid: Oid, path: []c
 
     while (true) {
         const parent = (try reader.firstParent(allocator, cur_commit)) orelse break;
+
+        // Bloom 优化：索引断言此 commit 相对 first parent 未改 `path` → blob 不变，跳过 tree 读取。
+        if (index) |idx| {
+            if (!idx.bloomMightContain(cur_commit, path)) {
+                cur_commit = parent;
+                continue;
+            }
+        }
+
         const parent_tree = try reader.commitTree(allocator, parent);
         const parent_blob_oid_opt = try tree_browse.findFile(allocator, reader, parent_tree, path);
 
@@ -156,7 +168,7 @@ test "blame: tiny README.md from initial commit" {
     const head = try ref.resolveHead(&repo);
     const root = try rootCommit(&rdr, head);
 
-    var b = try blame(testing.allocator, &rdr, "README.md");
+    var b = try blame(testing.allocator, &rdr, null, "README.md");
     defer b.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), b.lines.len);
@@ -173,7 +185,7 @@ test "blame: tiny src/nested.txt from HEAD" {
 
     const head = try ref.resolveHead(&repo);
 
-    var b = try blame(testing.allocator, &rdr, "src/nested.txt");
+    var b = try blame(testing.allocator, &rdr, null, "src/nested.txt");
     defer b.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), b.lines.len);
@@ -210,7 +222,7 @@ test "blame: edge rewrite.txt all from rewrite-all commit" {
     }
     try testing.expect(rewrite_all_commit != null);
 
-    var b = try blame(testing.allocator, &rdr, "rewrite.txt");
+    var b = try blame(testing.allocator, &rdr, null, "rewrite.txt");
     defer b.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 3), b.lines.len);
@@ -228,7 +240,7 @@ test "blame: edge empty file has zero lines" {
     var rdr = try Reader.open(&repo);
     defer rdr.close();
 
-    var b = try blame(testing.allocator, &rdr, "empty.txt");
+    var b = try blame(testing.allocator, &rdr, null, "empty.txt");
     defer b.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 0), b.lines.len);
@@ -244,7 +256,7 @@ test "blame: edge oneline.txt from root commit" {
     const head = try ref.resolveHead(&repo);
     const root = try rootCommit(&rdr, head);
 
-    var b = try blame(testing.allocator, &rdr, "oneline.txt");
+    var b = try blame(testing.allocator, &rdr, null, "oneline.txt");
     defer b.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), b.lines.len);
@@ -258,7 +270,7 @@ test "blame: missing file returns NotFound" {
     var rdr = try Reader.open(&repo);
     defer rdr.close();
 
-    try testing.expectError(error.NotFound, blame(testing.allocator, &rdr, "nonexistent.txt"));
+    try testing.expectError(error.NotFound, blame(testing.allocator, &rdr, null, "nonexistent.txt"));
 }
 
 test "blame: packed data.txt attributes modified lines correctly" {
@@ -267,7 +279,7 @@ test "blame: packed data.txt attributes modified lines correctly" {
     var rdr = try Reader.open(&repo);
     defer rdr.close();
 
-    var b = try blame(testing.allocator, &rdr, "data.txt");
+    var b = try blame(testing.allocator, &rdr, null, "data.txt");
     defer b.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 20), b.lines.len);
@@ -281,4 +293,34 @@ test "blame: packed data.txt attributes modified lines correctly" {
     // Unmodified lines share the same blame (v1).
     try testing.expect(std.mem.eql(u8, &b.commits[0].bytes, &b.commits[8].bytes));
     try testing.expect(std.mem.eql(u8, &b.commits[0].bytes, &b.commits[13].bytes));
+}
+
+test "blame with index: same result as without" {
+    const index_mod = @import("index.zig");
+    var repo = try openFixture("packed");
+    defer repo.close();
+    var rdr = try Reader.open(&repo);
+    defer rdr.close();
+
+    defer {
+        const dir = repo.worktree_dir orelse repo.git_dir;
+        dir.deleteFile(repo.io, ".zight/index") catch {};
+        dir.deleteDir(repo.io, ".zight") catch {};
+    }
+
+    try index_mod.build(&rdr, &repo, testing.allocator);
+    var idx = (try index_mod.open(&repo, testing.allocator)).?;
+    defer idx.deinit();
+
+    const head = try ref.resolveHead(&repo);
+
+    var b1 = try blameAt(testing.allocator, &rdr, null, head, "data.txt");
+    defer b1.deinit(testing.allocator);
+    var b2 = try blameAt(testing.allocator, &rdr, &idx, head, "data.txt");
+    defer b2.deinit(testing.allocator);
+
+    try testing.expectEqual(b1.lines.len, b2.lines.len);
+    for (b1.commits, b2.commits) |c1, c2| {
+        try testing.expect(std.mem.eql(u8, &c1.bytes, &c2.bytes));
+    }
 }

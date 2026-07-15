@@ -98,19 +98,38 @@ pub fn main() !void {
         std.debug.print("3b. tree full walk: {d:.3} ms, {} entries  [context]\n", .{ elapsed, entries });
     }
 
-    // 4. blame 单文件：自动发现一个根目录文件并 blame。
+    // 4. blame 单文件：自动发现一个根目录文件并 blame（含索引加速）。
     {
         const root_tree = try reader.commitTree(allocator, head_oid);
         const target_path = try findShallowFile(allocator, &reader, root_tree);
         defer if (target_path) |p| allocator.free(p);
 
+        // 构建索引
+        zight.index.build(&reader, &repo, allocator) catch |err| {
+            std.debug.print("index build failed: {}\n", .{err});
+        };
+        var idx_opt = zight.index.open(&repo, allocator) catch null;
+        defer if (idx_opt) |*idx| idx.deinit();
+
         if (target_path) |p| {
-            const start = nowTs(io);
-            var b = try zight.blameAt(allocator, &reader, head_oid, p);
-            const elapsed = elapsedMs(io, start);
-            const line_count = b.lines.len;
-            b.deinit(allocator);
-            std.debug.print("4. blame single file ({s}, {} lines): {d:.3} ms  [target <100ms]\n", .{ p, line_count, elapsed });
+            // 不带索引
+            {
+                const start = nowTs(io);
+                var b = try zight.blameAt(allocator, &reader, null, head_oid, p);
+                const elapsed = elapsedMs(io, start);
+                const line_count = b.lines.len;
+                b.deinit(allocator);
+                std.debug.print("4a. blame no index ({s}, {} lines): {d:.3} ms  [target <100ms]\n", .{ p, line_count, elapsed });
+            }
+            // 带索引
+            if (idx_opt) |*idx| {
+                const start = nowTs(io);
+                var b = try zight.blameAt(allocator, &reader, idx, head_oid, p);
+                const elapsed = elapsedMs(io, start);
+                const line_count = b.lines.len;
+                b.deinit(allocator);
+                std.debug.print("4b. blame with index ({s}, {} lines): {d:.3} ms  [target <100ms]\n", .{ p, line_count, elapsed });
+            }
         } else {
             std.debug.print("4. blame: no suitable file found\n", .{});
         }

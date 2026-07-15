@@ -3,3 +3,5 @@ zig-out/
 test/fixtures/*/
 
 .trae/
+
+docs/adr/

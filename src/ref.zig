@@ -4,6 +4,7 @@
 //! HEAD（symbolic 与 detached）。symref 链深度上限 5，超出返回 `SymrefTooDeep`。
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const Oid = @import("hash.zig").Oid;
 const Repo = @import("repo.zig").Repo;
@@ -111,6 +112,78 @@ fn findInPackedRefs(repo: *Repo, name: []const u8) ZightError!?Oid {
     return null;
 }
 
+/// 枚举所有 ref 的最终 tip oid（loose refs + packed-refs + HEAD），去重升序。
+/// 用于索引失效检测（ADR 001）：拼接后 SHA-1 即得 `ref_tips_digest`。
+/// 调用方拥有返回切片。无任何 ref 时返回空切片。
+pub fn collectTips(repo: *Repo, allocator: Allocator) ZightError![]Oid {
+    var set = std.AutoHashMap([20]u8, void).init(allocator);
+    defer set.deinit();
+
+    try addTip(repo, &set, "HEAD");
+    try walkLooseRefs(repo, allocator, "refs", &set);
+    try collectPackedTips(repo, &set);
+
+    var list = std.ArrayList(Oid).empty;
+    defer list.deinit(allocator);
+    var it = set.keyIterator();
+    while (it.next()) |k| {
+        list.append(allocator, .{ .bytes = k.* }) catch return error.OutOfMemory;
+    }
+    std.mem.sort(Oid, list.items, {}, oidLessThan);
+    return list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+fn addTip(repo: *Repo, set: *std.AutoHashMap([20]u8, void), name: []const u8) ZightError!void {
+    if (resolveRef(repo, name)) |oid| {
+        set.put(oid.bytes, {}) catch return error.OutOfMemory;
+    } else |_| {}
+}
+
+fn oidLessThan(_: void, a: Oid, b: Oid) bool {
+    return std.mem.order(u8, &a.bytes, &b.bytes) == .lt;
+}
+
+/// 递归遍历 `.git/<prefix>` 下的 loose ref 文件，解析为 tip oid 加入 `set`。
+fn walkLooseRefs(repo: *Repo, allocator: Allocator, prefix: []const u8, set: *std.AutoHashMap([20]u8, void)) ZightError!void {
+    var dir = repo.git_dir.openDir(repo.io, prefix, .{ .iterate = true, .access_sub_paths = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+        else => return error.IoFailed,
+    };
+    defer dir.close(repo.io);
+
+    var it = dir.iterate();
+    while (it.next(repo.io)) |entry_opt| {
+        const entry = entry_opt orelse break;
+        const child = std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name }) catch return error.OutOfMemory;
+        defer allocator.free(child);
+        switch (entry.kind) {
+            .directory => try walkLooseRefs(repo, allocator, child, set),
+            .file => try addTip(repo, set, child),
+            else => {},
+        }
+    } else |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+        else => return error.IoFailed,
+    }
+}
+
+/// 解析 packed-refs 中所有 ref 名，解析为 tip oid 加入 `set`。
+fn collectPackedTips(repo: *Repo, set: *std.AutoHashMap([20]u8, void)) ZightError!void {
+    const data = repo.readGitFileUnlimited("packed-refs") catch |err| switch (err) {
+        error.NotFound => return,
+        else => |e| return e,
+    };
+    defer repo.allocator.free(data);
+
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        try addTip(repo, set, line[space + 1 ..]);
+    }
+}
+
 const testing = std.testing;
 
 fn openFixture(name: []const u8) !Repo {
@@ -158,4 +231,45 @@ test "packed-refs lookup via merge fixture" {
     const r = try readRef(&repo, "refs/heads/main");
     try std.testing.expect(r != null);
     try std.testing.expect(r.? == .oid);
+}
+
+test "collectTips: tiny has HEAD tip" {
+    var repo = try openFixture("tiny");
+    defer repo.close();
+    const tips = try collectTips(&repo, testing.allocator);
+    defer testing.allocator.free(tips);
+    try testing.expect(tips.len >= 1);
+    const head = try resolveHead(&repo);
+    var found = false;
+    for (tips) |t| if (std.mem.eql(u8, &t.bytes, &head.bytes)) {
+        found = true;
+        break;
+    };
+    try testing.expect(found);
+    // 升序
+    for (tips[1..], tips[0 .. tips.len - 1]) |b, a| {
+        try testing.expect(std.mem.order(u8, &a.bytes, &b.bytes) != .gt);
+    }
+}
+
+test "collectTips: merge dedups shared tips" {
+    var repo = try openFixture("merge");
+    defer repo.close();
+    const tips = try collectTips(&repo, testing.allocator);
+    defer testing.allocator.free(tips);
+    // merge fixture: main, branchB, branchC 都指向各自最新 commit；至少 1 个
+    try testing.expect(tips.len >= 1);
+    // 无重复（去重）
+    var i: usize = 0;
+    while (i + 1 < tips.len) : (i += 1) {
+        try testing.expect(!std.mem.eql(u8, &tips[i].bytes, &tips[i + 1].bytes));
+    }
+}
+
+test "collectTips: empty repo returns empty slice" {
+    var repo = try openFixture("empty");
+    defer repo.close();
+    const tips = try collectTips(&repo, testing.allocator);
+    defer testing.allocator.free(tips);
+    try testing.expectEqual(@as(usize, 0), tips.len);
 }

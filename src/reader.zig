@@ -177,7 +177,89 @@ pub const Reader = struct {
         }
         return null;
     }
+
+    /// 读取 commit 对象并一次性解析 tree oid + 全部 parents + committer time。
+    /// `parents` 由调用方拥有，须 `deinit` 释放。比分别 `commitTree`+`firstParent`
+    /// 少一次 commit 读取。
+    pub fn commitMeta(self: *Reader, allocator: Allocator, commit_oid: Oid) ZightError!CommitMeta {
+        var obj = try self.readObject(commit_oid);
+        defer obj.deinit(allocator);
+        if (obj.type != .commit) return error.MalformedObject;
+        return parseCommitMeta(allocator, obj.content);
+    }
+
+    /// 将 `oid` peel 到 commit。若已是 commit 直接返回；若为 tag 对象，
+    /// 跟随其 `object` 字段直到到达 commit。tag 嵌套深度上限 10。
+    pub fn peelToCommit(self: *Reader, allocator: Allocator, oid: Oid) ZightError!Oid {
+        var current = oid;
+        var depth: u32 = 0;
+        while (depth < 10) : (depth += 1) {
+            var obj = try self.readObject(current);
+            defer obj.deinit(allocator);
+            switch (obj.type) {
+                .commit => return current,
+                .tag => {
+                    if (!std.mem.startsWith(u8, obj.content, "object ")) return error.MalformedObject;
+                    current = Oid.fromHex(obj.content[7..47]) catch return error.MalformedObject;
+                },
+                else => return error.MalformedObject,
+            }
+        }
+        return error.LimitExceeded;
+    }
 };
+
+/// commit 元数据（一次解析所得）。`parents` 由调用方拥有。
+pub const CommitMeta = struct {
+    tree: Oid,
+    parents: []Oid,
+    committer_time: i64,
+
+    pub fn deinit(self: *CommitMeta, gpa: Allocator) void {
+        gpa.free(self.parents);
+        self.parents = &.{};
+    }
+};
+
+/// 解析 commit 内容头部：`tree`、所有 `parent`、`committer` time。
+fn parseCommitMeta(allocator: Allocator, content: []const u8) ZightError!CommitMeta {
+    var parents: std.ArrayList(Oid) = .empty;
+    errdefer parents.deinit(allocator);
+
+    var tree: Oid = Oid{ .bytes = undefined };
+    var have_tree = false;
+    var committer_time: i64 = 0;
+    var have_committer = false;
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) break;
+        if (std.mem.startsWith(u8, line, "tree ")) {
+            tree = Oid.fromHex(line[5..45]) catch return error.MalformedObject;
+            have_tree = true;
+        } else if (std.mem.startsWith(u8, line, "parent ")) {
+            parents.append(allocator, Oid.fromHex(line[7..47]) catch return error.MalformedObject) catch return error.OutOfMemory;
+        } else if (std.mem.startsWith(u8, line, "committer ")) {
+            committer_time = parseCommitterTime(line) catch return error.MalformedObject;
+            have_committer = true;
+        }
+    }
+
+    if (!have_tree or !have_committer) return error.MalformedObject;
+    return .{
+        .tree = tree,
+        .parents = try parents.toOwnedSlice(allocator),
+        .committer_time = committer_time,
+    };
+}
+
+/// 从 `committer` 行末尾提取 unix 时间戳（倒数第二个 token，跳过时区）。
+fn parseCommitterTime(line: []const u8) ZightError!i64 {
+    var it = std.mem.splitBackwardsScalar(u8, line, ' ');
+    _ = it.first(); // tz
+    const ts_str = it.next() orelse return error.MalformedObject;
+    return std.fmt.parseInt(i64, ts_str, 10) catch return error.MalformedObject;
+}
 
 fn mapPackError(err: PackError) ZightError {
     return switch (err) {
@@ -338,4 +420,31 @@ test "Reader.commitTree rejects non-commit" {
     const tip = try headOid(&repo);
     const tree = try reader.commitTree(testing.allocator, tip);
     try testing.expectError(error.MalformedObject, reader.commitTree(testing.allocator, tree));
+}
+
+test "Reader.peelToCommit: annotated tag peels to commit" {
+    var repo = try openFixture("tiny");
+    defer repo.close();
+    var reader = try Reader.open(&repo);
+    defer reader.close();
+
+    const tag_hex = try repo.readGitFileUnlimited("refs/tags/v1.0");
+    defer testing.allocator.free(tag_hex);
+    const trimmed = std.mem.trimEnd(u8, tag_hex, " \t\r\n");
+    const tag_oid = try Oid.fromHex(trimmed);
+
+    const commit_oid = try reader.peelToCommit(testing.allocator, tag_oid);
+    const head = try headOid(&repo);
+    try testing.expect(Oid.eql(commit_oid, head));
+}
+
+test "Reader.peelToCommit: commit returns itself" {
+    var repo = try openFixture("tiny");
+    defer repo.close();
+    var reader = try Reader.open(&repo);
+    defer reader.close();
+
+    const head = try headOid(&repo);
+    const peeled = try reader.peelToCommit(testing.allocator, head);
+    try testing.expect(Oid.eql(peeled, head));
 }
