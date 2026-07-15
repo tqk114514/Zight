@@ -2,7 +2,9 @@
 # 生成 test/fixtures 下测试用 git 仓库。幂等：先删后建。详见 rule.md §8.2。
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[ "$SCRIPT_DIR" = "${BASH_SOURCE[0]}" ] && SCRIPT_DIR="."
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd)"
 
 # --- tiny：loose 对象 fixture ---
 FIXTURE="$SCRIPT_DIR/tiny"
@@ -53,7 +55,17 @@ build_packed() {
     git add other.txt
     git commit -q -m "add other"
 
-    git -c pack.useDeltaBaseOffset="$use_dbo" repack -a -d -f
+    if [ "$use_dbo" = "true" ]; then
+        git repack -a -d -f
+    else
+        # git for Windows 2.55.0 忽略 -c pack.useDeltaBaseOffset=false，
+        # 必须用 pack-objects --no-delta-base-offset 强制 REF_DELTA。
+        git rev-list --all --objects | \
+            git pack-objects --no-delta-base-offset .git/objects/pack/pack >/dev/null
+        # 删除已入 pack 的 loose 对象
+        find .git/objects -type f ! -path '*/pack/*' ! -path '*/info/*' -delete
+        find .git/objects -type d -empty -delete
+    fi
     rm -rf .git/hooks
 }
 

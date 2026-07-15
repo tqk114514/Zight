@@ -1,237 +1,139 @@
-//! Zight vs Git 基准测试（rule.md §6.1 性能目标）。
+//! 基准测试：对 NebulaStudios-Website 实测 §6.1 性能目标。
 //!
-//! 用法:
-//!   zig build bench -Doptimize=ReleaseFast -- [repo_path] [iterations] [blame_file]
-//!   repo_path    默认 D:\Project\Linux
-//!   iterations   默认 3
-//!   blame_file   默认 init/main.c
+//! 目标：单个小对象读取 < 1 ms（warm）、log 全量 < 50 ms、
+//! 文件树首屏 < 50 ms、blame 单文件 < 100 ms。
+//! 不达标时进入 §6.3 索引层流程（rule.md §6.1）。
 //!
-//! 测量:
-//!   - setup: 打开 repo + openPacks（1 次，冷启动）
-//!   - warm:  repo 常驻，op 重复 N 次取 min/avg（OS 与进程内缓存均已热）
-//!   - git:   子进程重复 N 次取 min（OS 缓存热，进程冷）
-//!
-//! 目标（rule.md §6.1）:
-//!   - readObject   < 1 ms (warm)
-//!   - logIter 20   < 200 ms
-//!   - browseTree   < 500 ms (首屏前 100 条)
-//!   - blameFile     < 1 s
+//! 计时使用 `std.Io.Clock.awake`（单调时钟，Linux 对应 CLOCK_MONOTONIC）。
 
 const std = @import("std");
-const Io = std.Io;
 const zight = @import("zight");
+const Io = std.Io;
+const Clock = Io.Clock;
+const Allocator = std.mem.Allocator;
 
-const Repo = zight.Repo;
-const Pack = zight.Pack;
-const Index = zight.Index;
-
-const DEFAULT_REPO = "D:\\Project\\NebulaStudios-Website";
-const BLAME_PATH_DEFAULT = "package.json";
-const BROWSE_FIRST_N: usize = 100;
-const DEFAULT_ITERS: usize = 3;
-
-const Ctx = struct {
-    alloc: std.mem.Allocator,
-    repo: *Repo,
-    packs: []Pack,
-    graph: ?Index,
-    head_oid: [20]u8,
-    tree_oid: [20]u8,
-    blame_path: []const u8,
-};
-
-fn opReadObject(c: *const Ctx) anyerror!void {
-    var obj = try zight.readObject(c.alloc, c.repo, c.packs, c.head_oid);
-    defer obj.deinit(c.alloc);
-    std.mem.doNotOptimizeAway(obj.data.ptr);
+fn nowTs(io: Io) Io.Timestamp {
+    return Clock.awake.now(io);
 }
 
-fn opLog(c: *const Ctx) anyerror!void {
-    const graph_ptr: ?*const Index = if (c.graph) |*g| g else null;
-    var it = try zight.logIter(c.repo, c.packs, graph_ptr, &.{c.head_oid}, .{});
-    defer it.deinit();
-    while (try it.next()) |entry| {
-        var e = entry;
-        defer e.deinit(c.alloc);
-    }
+fn elapsedMs(io: Io, start: Io.Timestamp) f64 {
+    const ns = start.durationTo(nowTs(io)).nanoseconds;
+    return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
-fn opBrowseTree(c: *const Ctx) anyerror!void {
-    var it = try zight.browseTree(c.repo, c.packs, c.tree_oid, c.alloc);
-    defer it.deinit();
-    var n: usize = 0;
-    while (n < BROWSE_FIRST_N) : (n += 1) {
-        var e = (try it.next()) orelse break;
-        defer e.deinit(c.alloc);
-    }
-}
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-fn opBlame(c: *const Ctx) anyerror!void {
-    const graph_ptr: ?*const Index = if (c.graph) |*g| g else null;
-    var it = try zight.blameFile(c.repo, c.packs, graph_ptr, c.head_oid, c.blame_path, c.alloc);
-    defer it.deinit();
-    while (it.next()) |entry| {
-        std.mem.doNotOptimizeAway(&entry);
-    }
-}
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-const WarmStats = struct {
-    min_ms: f64,
-    avg_ms: f64,
-};
+    const repo_path = "D:\\Project\\NebulaStudios-Website";
 
-fn nowNs(io: Io) i96 {
-    return Io.Clock.awake.now(io).nanoseconds;
-}
-
-fn msFromNs(ns: i96) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-}
-
-fn benchWarm(io: Io, c: *const Ctx, op: *const fn (*const Ctx) anyerror!void, n: usize) !WarmStats {
-    var min_ms: f64 = std.math.inf(f64);
-    var sum_ms: f64 = 0;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const t = nowNs(io);
-        try op(c);
-        const ms = msFromNs(nowNs(io) - t);
-        if (ms < min_ms) min_ms = ms;
-        sum_ms += ms;
-    }
-    return .{ .min_ms = min_ms, .avg_ms = sum_ms / @as(f64, @floatFromInt(n)) };
-}
-
-fn benchGit(io: Io, alloc: std.mem.Allocator, repo_path: []const u8, argv: []const []const u8, n: usize) !f64 {
-    var min_ms: f64 = std.math.inf(f64);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const t = nowNs(io);
-        const result = try std.process.run(alloc, io, .{
-            .argv = argv,
-            .cwd = .{ .path = repo_path },
-        });
-        defer {
-            alloc.free(result.stdout);
-            alloc.free(result.stderr);
-        }
-        switch (result.term) {
-            .exited => |code| if (code != 0) return error.GitFailed,
-            else => return error.GitFailed,
-        }
-        const ms = msFromNs(nowNs(io) - t);
-        if (ms < min_ms) min_ms = ms;
-    }
-    return min_ms;
-}
-
-fn printLine(io: Io, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [4096]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, fmt, args);
-    try Io.File.stdout().writeStreamingAll(io, line);
-}
-
-fn verdict(warm_min_ms: f64, target_ms: f64) []const u8 {
-    return if (warm_min_ms <= target_ms) "PASS" else "FAIL";
-}
-
-fn scenario(
-    io: Io,
-    alloc: std.mem.Allocator,
-    c: *const Ctx,
-    repo_path: []const u8,
-    name: []const u8,
-    target_ms: f64,
-    op: *const fn (*const Ctx) anyerror!void,
-    git_argv: []const []const u8,
-    iters: usize,
-) !void {
-    try printLine(io, "\n[{s}] target <{d}ms\n", .{ name, @as(u64, @intFromFloat(target_ms)) });
-    const warm = benchWarm(io, c, op, iters) catch |err| {
-        try printLine(io, "  warm: ERROR {s}\n", .{@errorName(err)});
+    var repo = zight.Repo.open(io, allocator, repo_path) catch |err| {
+        std.debug.print("open failed: {}\n", .{err});
         return;
     };
-    try printLine(io, "  warm: min={d:.3} ms  avg={d:.3} ms  {s}\n", .{
-        warm.min_ms, warm.avg_ms, verdict(warm.min_ms, target_ms),
-    });
-    const git_ms = benchGit(io, alloc, repo_path, git_argv, iters) catch |err| {
-        try printLine(io, "  git:  ERROR {s}\n", .{@errorName(err)});
-        return;
-    };
-    try printLine(io, "  git:  min={d:.3} ms\n", .{git_ms});
-}
+    defer repo.close();
 
-pub fn main(init: std.process.Init) !void {
-    const alloc = init.gpa;
-    const io = init.io;
+    var reader = try zight.Reader.open(&repo);
+    defer reader.close();
 
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const repo_path = if (args.len > 1) args[1] else DEFAULT_REPO;
-    const iters: usize = if (args.len > 2)
-        std.fmt.parseInt(usize, args[2], 10) catch DEFAULT_ITERS
-    else
-        DEFAULT_ITERS;
-    const blame_path = if (args.len > 3) args[3] else BLAME_PATH_DEFAULT;
+    const head_oid = try zight.ref.resolveHead(&repo);
+    var head_hex: [40]u8 = undefined;
+    head_oid.toHex(&head_hex);
+    std.debug.print("repo: {s}\nHEAD: {s}\n\n", .{ repo_path, head_hex });
 
-    try printLine(io, "=== Zight vs Git Benchmark ===\n", .{});
-    try printLine(io, "repo: {s}\n", .{repo_path});
-    try printLine(io, "iterations: {d}\n", .{iters});
-    try printLine(io, "blame file: {s}\n", .{blame_path});
-
-    const t_setup = nowNs(io);
-    var warm_repo = try Repo.open(alloc, io, repo_path);
-    var warm_packs = try zight.openPacks(&warm_repo, alloc);
-    var warm_graph: ?Index = Index.open(&warm_repo, alloc) catch null;
-    if (warm_graph == null) {
-        const t_build = nowNs(io);
-        try Index.build(&warm_repo, warm_packs.items, alloc);
-        const build_ms = msFromNs(nowNs(io) - t_build);
-        try printLine(io, "index build: {d:.2} ms\n", .{build_ms});
-        warm_graph = Index.open(&warm_repo, alloc) catch null;
+    // 1. 单个小对象读取（warm）：读 HEAD commit 两次，计时第二次。
+    {
+        var o1 = try reader.readObject(head_oid);
+        o1.deinit(allocator);
+        const start = nowTs(io);
+        var o2 = try reader.readObject(head_oid);
+        const elapsed = elapsedMs(io, start);
+        o2.deinit(allocator);
+        std.debug.print("1. object read (warm, HEAD commit): {d:.3} ms  [target <1ms]\n", .{elapsed});
     }
-    defer if (warm_graph) |*g| g.deinit();
-    const setup_ms = msFromNs(nowNs(io) - t_setup);
-    try printLine(io, "setup (open repo + openPacks + index): {d:.2} ms\n", .{setup_ms});
 
-    const head_oid = try zight.resolveSymrefChain(&warm_repo, "HEAD");
-    if (warm_graph) |g| {
-        try printLine(io, "index count: {d}\n", .{g.count});
-        const head_meta = g.getMeta(head_oid, alloc) catch null;
-        if (head_meta) |m| {
-            try printLine(io, "HEAD found in index: yes\n", .{});
-            var mm = m;
-            mm.deinit(alloc);
+    // 2. log 全量：遍历全部 commit 历史。
+    {
+        var log = try zight.Log.open(&reader, allocator, head_oid);
+        defer log.close();
+        const start = nowTs(io);
+        var count: usize = 0;
+        while (try log.next()) |entry| {
+            var e = entry;
+            e.deinit(allocator);
+            count += 1;
+        }
+        const elapsed = elapsedMs(io, start);
+        std.debug.print("2. log full: {d:.3} ms, {} commits  [target <50ms]\n", .{ elapsed, count });
+    }
+
+    // 3. 文件树首屏：读 root tree 对象（首屏主要成本 = 一次 tree 读取）。
+    //    另测全量 tree 遍历作为上界参考。
+    {
+        const root_tree = try reader.commitTree(allocator, head_oid);
+
+        // 首屏：root tree 读取（warm）
+        {
+            var t1 = try reader.readObject(root_tree);
+            t1.deinit(allocator);
+            const start = nowTs(io);
+            var t2 = try reader.readObject(root_tree);
+            const elapsed = elapsedMs(io, start);
+            t2.deinit(allocator);
+            std.debug.print("3a. tree first-screen (root tree read, warm): {d:.3} ms  [target <50ms]\n", .{elapsed});
+        }
+
+        // 全量遍历：所有 tree 对象（上界参考）
+        const start = nowTs(io);
+        var w = try zight.TreeWalker.open(&reader, allocator, root_tree);
+        defer w.close();
+        var entries: usize = 0;
+        while (try w.next()) |_| entries += 1;
+        const elapsed = elapsedMs(io, start);
+        std.debug.print("3b. tree full walk: {d:.3} ms, {} entries  [context]\n", .{ elapsed, entries });
+    }
+
+    // 4. blame 单文件：自动发现一个根目录文件并 blame。
+    {
+        const root_tree = try reader.commitTree(allocator, head_oid);
+        const target_path = try findShallowFile(allocator, &reader, root_tree);
+        defer if (target_path) |p| allocator.free(p);
+
+        if (target_path) |p| {
+            const start = nowTs(io);
+            var b = try zight.blameAt(allocator, &reader, head_oid, p);
+            const elapsed = elapsedMs(io, start);
+            const line_count = b.lines.len;
+            b.deinit(allocator);
+            std.debug.print("4. blame single file ({s}, {} lines): {d:.3} ms  [target <100ms]\n", .{ p, line_count, elapsed });
         } else {
-            try printLine(io, "HEAD found in index: NO\n", .{});
+            std.debug.print("4. blame: no suitable file found\n", .{});
         }
-    } else {
-        try printLine(io, "index: not found\n", .{});
     }
+}
 
-    var commit_obj = try zight.readObject(alloc, &warm_repo, warm_packs.items, head_oid);
-    var commit_info = try zight.parseCommit(alloc, commit_obj);
-    const tree_oid = commit_info.tree;
-    commit_info.deinit(alloc);
-    commit_obj.deinit(alloc);
-
-    const ctx = Ctx{
-        .alloc = alloc,
-        .repo = &warm_repo,
-        .packs = warm_packs.items,
-        .graph = warm_graph,
-        .head_oid = head_oid,
-        .tree_oid = tree_oid,
-        .blame_path = blame_path,
-    };
-
-    try scenario(io, alloc, &ctx, repo_path, "readObject", 1.0, opReadObject, &.{ "git", "cat-file", "-p", "HEAD" }, iters);
-    try scenario(io, alloc, &ctx, repo_path, "log all commits", 5000.0, opLog, &.{ "git", "log", "--oneline" }, iters);
-    try scenario(io, alloc, &ctx, repo_path, "browseTree first 100", 500.0, opBrowseTree, &.{ "git", "ls-tree", "HEAD" }, iters);
-    try scenario(io, alloc, &ctx, repo_path, "blame", 1000.0, opBlame, &.{ "git", "blame", blame_path }, iters);
-
-    for (warm_packs.items) |*p| p.close();
-    warm_packs.deinit(alloc);
-    warm_repo.close();
-
-    try printLine(io, "\n(done)\n", .{});
+/// 找一个根目录浅文件（路径无 '/'）。无则回退到任意第一个文件。
+fn findShallowFile(allocator: Allocator, reader: *zight.Reader, root_tree: zight.hash.Oid) !?[]u8 {
+    var w = try zight.TreeWalker.open(reader, allocator, root_tree);
+    defer w.close();
+    var fallback: ?[]u8 = null;
+    defer if (fallback) |p| allocator.free(p);
+    while (try w.next()) |entry| {
+        if (entry.mode != .file and entry.mode != .executable) continue;
+        if (std.mem.indexOfScalar(u8, entry.path, '/') == null) {
+            return try allocator.dupe(u8, entry.path);
+        }
+        if (fallback == null) fallback = try allocator.dupe(u8, entry.path);
+    }
+    if (fallback) |p| {
+        const owned = p;
+        fallback = null;
+        return owned;
+    }
+    return null;
 }
