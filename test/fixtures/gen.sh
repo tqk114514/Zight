@@ -185,3 +185,21 @@ printf "ref: refs/chain/g\n" > .git/refs/chain/f
 printf "%s\n" "$HEAD_OID" > .git/refs/chain/g
 
 rm -rf .git/hooks
+
+# --- malformed：畸形 loose 对象 fixture（reader pub API 切片越界 panic 复现）---
+FIXTURE="$SCRIPT_DIR/malformed"
+rm -rf "$FIXTURE"
+mkdir -p "$FIXTURE"
+cd "$FIXTURE"
+git init -q -b main
+git config core.autocrlf false
+rm -rf .git/hooks
+
+# git hash-object --literally 绕过 fsck，只做 zlib 压缩 + hash + 存储，
+# 用来构造 hash 校验通过但内容畸形的 loose 对象。
+# 畸形 commit content="tree abc"（行长 8 < 45，触发 commitTree 切片越界）
+printf "tree abc" | git hash-object --literally -t commit -w --stdin >/dev/null
+# 畸形 commit content="parent abc"（行长 10 < 47，触发 firstParent 切片越界）
+printf "parent abc" | git hash-object --literally -t commit -w --stdin >/dev/null
+# 畸形 tag content="object abc"（行长 10 < 47，触发 peelToCommit 切片越界）
+printf "object abc" | git hash-object --literally -t tag -w --stdin >/dev/null

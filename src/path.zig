@@ -24,7 +24,7 @@ pub fn validateRelative(path: []const u8) PathError![]const u8 {
     }
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
     if (path[0] == '/') return error.AbsolutePath;
-    if (path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':') {
+    if (path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and (path[2] == '/' or path[2] == '\\')) {
         return error.AbsolutePath;
     }
     if (std.mem.indexOfScalar(u8, path, '\\') != null) return error.InvalidPath;
@@ -53,7 +53,7 @@ pub fn validateRefName(name: []const u8) PathError!void {
     if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidPath;
     if (std.mem.indexOfScalar(u8, name, '\\') != null) return error.InvalidPath;
     if (name[0] == '-' or name[0] == '/') return error.InvalidPath;
-    if (name[name.len - 1] == '/') return error.InvalidPath;
+    if (name[name.len - 1] == '/' or name[name.len - 1] == '.') return error.InvalidPath;
     if (std.mem.indexOf(u8, name, "..") != null) return error.InvalidPath;
     if (std.mem.indexOf(u8, name, "/.") != null) return error.InvalidPath;
     if (name.len >= 2 and std.mem.eql(u8, name[0..2], "./")) return error.InvalidPath;
@@ -108,4 +108,15 @@ test "validateRefName rejects malformed" {
     try std.testing.expectError(error.InvalidPath, validateRefName("refs/heads/.main"));
     try std.testing.expectError(error.InvalidPath, validateRefName("refs/heads/main with space"));
     try std.testing.expectError(error.InvalidPath, validateRefName("refs\\heads\\main"));
+}
+
+test "validateRelative: 'a:b' should be valid relative path" {
+    // 冒号在 git tree entry name 中合法；'a:b' 是相对路径，
+    // 但 validateRelative 因 path[1]==':' 且 path[0] 为字母误判为 Windows 盘符绝对路径。
+    try std.testing.expectEqualStrings("a:b", try validateRelative("a:b"));
+}
+
+test "validateRefName: rejects trailing dot" {
+    // git refman: refname 不能以 '.' 结尾。
+    try std.testing.expectError(error.InvalidPath, validateRefName("refs/heads/main."));
 }

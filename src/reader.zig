@@ -159,7 +159,8 @@ pub const Reader = struct {
         defer obj.deinit(allocator);
         if (obj.type != .commit) return error.MalformedObject;
         if (!std.mem.startsWith(u8, obj.content, "tree ")) return error.MalformedObject;
-        return Oid.fromHex(obj.content[5..45]) catch error.MalformedObject;
+        const nl = std.mem.indexOfScalar(u8, obj.content, '\n') orelse return error.MalformedObject;
+        return Oid.fromHex(obj.content[5..nl]) catch error.MalformedObject;
     }
 
     /// 读取 commit 对象并解析其首个 `parent` 字段 oid。
@@ -171,7 +172,7 @@ pub const Reader = struct {
         var it = std.mem.splitScalar(u8, obj.content, '\n');
         while (it.next()) |line| {
             if (std.mem.startsWith(u8, line, "parent ")) {
-                return Oid.fromHex(line[7..47]) catch error.MalformedObject;
+                return Oid.fromHex(line[7..]) catch error.MalformedObject;
             }
             if (line.len == 0) break;
         }
@@ -200,7 +201,8 @@ pub const Reader = struct {
                 .commit => return current,
                 .tag => {
                     if (!std.mem.startsWith(u8, obj.content, "object ")) return error.MalformedObject;
-                    current = Oid.fromHex(obj.content[7..47]) catch return error.MalformedObject;
+                    const nl = std.mem.indexOfScalar(u8, obj.content, '\n') orelse return error.MalformedObject;
+                    current = Oid.fromHex(obj.content[7..nl]) catch return error.MalformedObject;
                 },
                 else => return error.MalformedObject,
             }
@@ -235,10 +237,10 @@ fn parseCommitMeta(allocator: Allocator, content: []const u8) ZightError!CommitM
     while (it.next()) |line| {
         if (line.len == 0) break;
         if (std.mem.startsWith(u8, line, "tree ")) {
-            tree = Oid.fromHex(line[5..45]) catch return error.MalformedObject;
+            tree = Oid.fromHex(line[5..]) catch return error.MalformedObject;
             have_tree = true;
         } else if (std.mem.startsWith(u8, line, "parent ")) {
-            parents.append(allocator, Oid.fromHex(line[7..47]) catch return error.MalformedObject) catch return error.OutOfMemory;
+            parents.append(allocator, Oid.fromHex(line[7..]) catch return error.MalformedObject) catch return error.OutOfMemory;
         } else if (std.mem.startsWith(u8, line, "committer ")) {
             committer_time = parseCommitterTime(line) catch return error.MalformedObject;
             have_committer = true;
@@ -447,4 +449,55 @@ test "Reader.peelToCommit: commit returns itself" {
     const head = try headOid(&repo);
     const peeled = try reader.peelToCommit(testing.allocator, head);
     try testing.expect(Oid.eql(peeled, head));
+}
+
+test "parseCommitMeta: short tree line returns MalformedObject not panic" {
+    const malformed = "tree abc\ncommitter a <a@a> 1 +0000\n\nmsg";
+    try testing.expectError(error.MalformedObject, parseCommitMeta(testing.allocator, malformed));
+}
+
+test "parseCommitMeta: short parent line returns MalformedObject not panic" {
+    const malformed = "tree 0000000000000000000000000000000000000000\nparent abc\ncommitter a <a@a> 1 +0000\n\nmsg";
+    try testing.expectError(error.MalformedObject, parseCommitMeta(testing.allocator, malformed));
+}
+
+fn computeLooseOid(obj_type: []const u8, content: []const u8) Oid {
+    var header_buf: [32]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "{s} {d}\x00", .{ obj_type, content.len }) catch unreachable;
+    var hasher = hash.Sha1Hasher.init();
+    hasher.update(header);
+    hasher.update(content);
+    var oid: Oid = .{ .bytes = undefined };
+    hasher.final(&oid.bytes);
+    return oid;
+}
+
+test "commitTree: short tree content returns MalformedObject not panic" {
+    var repo = try openFixture("malformed");
+    defer repo.close();
+    var reader = try Reader.open(&repo);
+    defer reader.close();
+
+    const oid = computeLooseOid("commit", "tree abc");
+    try testing.expectError(error.MalformedObject, reader.commitTree(testing.allocator, oid));
+}
+
+test "firstParent: short parent line returns MalformedObject not panic" {
+    var repo = try openFixture("malformed");
+    defer repo.close();
+    var reader = try Reader.open(&repo);
+    defer reader.close();
+
+    const oid = computeLooseOid("commit", "parent abc");
+    try testing.expectError(error.MalformedObject, reader.firstParent(testing.allocator, oid));
+}
+
+test "peelToCommit: short tag object content returns MalformedObject not panic" {
+    var repo = try openFixture("malformed");
+    defer repo.close();
+    var reader = try Reader.open(&repo);
+    defer reader.close();
+
+    const oid = computeLooseOid("tag", "object abc");
+    try testing.expectError(error.MalformedObject, reader.peelToCommit(testing.allocator, oid));
 }
