@@ -176,6 +176,7 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
     }
 
     std.mem.sort(BuildEntry, entries.items, {}, buildEntryOidLessThan);
+
     return serializeBuffer(allocator, &digest, entries.items);
 }
 

@@ -29,7 +29,7 @@ pub const WalkEntry = struct {
     oid: Oid,
 };
 
-const RawEntry = struct {
+pub const RawEntry = struct {
     mode: TreeMode,
     name: []const u8,
     oid: Oid,
@@ -119,7 +119,7 @@ pub const TreeWalker = struct {
 };
 
 /// 解析 tree 内容中 `pos` 处的下一条目；越界返回 `null`。
-fn parseEntry(buf: []const u8, pos: *usize) ?RawEntry {
+pub fn parseEntry(buf: []const u8, pos: *usize) ?RawEntry {
     if (pos.* >= buf.len) return null;
 
     const space = std.mem.indexOfScalarPos(u8, buf, pos.*, ' ') orelse return null;

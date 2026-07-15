@@ -1,8 +1,9 @@
 //! 文件级 tree diff + 行级 diff 便捷函数。
 //!
-//! 职责（§2.4）：给定两个 tree oid，深度优先并行遍历，按路径归并比较，
-//! 产出文件级变更（added/deleted/modified）。git tree 条目按名排序，
-//! DFS 产出的全路径满足字典序，可直接归并连接。
+//! 职责（§2.4）：给定两个 tree oid，按 tree 条目名归并比较。
+//! 两个 tree 条目按名匹配，OID 相同直接跳过（含子树，不递归读取），
+//! 只有 OID 不同的子树才递归。这使索引构建只读变更路径上的 tree，
+//! 而非全量遍历。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,8 +11,8 @@ const Allocator = std.mem.Allocator;
 const Oid = @import("hash.zig").Oid;
 const Reader = @import("reader.zig").Reader;
 const tree_browse = @import("tree_browse.zig");
-const TreeWalker = tree_browse.TreeWalker;
-const WalkEntry = tree_browse.WalkEntry;
+const RawEntry = tree_browse.RawEntry;
+const parseEntry = tree_browse.parseEntry;
 const TreeMode = tree_browse.TreeMode;
 const line_diff = @import("line_diff.zig");
 const DiffOp = line_diff.DiffOp;
@@ -19,7 +20,7 @@ const ZightError = @import("error.zig").ZightError;
 
 pub const ChangeKind = enum { added, deleted, modified };
 
-/// 单条文件变更。`path` 指向 TreeDiff 内部 walker 缓冲，在下一次 `next` 前有效。
+/// 单条文件变更。`path` 指向 TreeDiff 内部缓冲，在下一次 `next` 前有效。
 pub const FileChange = struct {
     kind: ChangeKind,
     path: []const u8,
@@ -27,86 +28,193 @@ pub const FileChange = struct {
     new_oid: ?Oid, // null for deleted
 };
 
+const DiffFrame = struct {
+    old_content: ?[]const u8, // null = old 侧无此子树
+    new_content: ?[]const u8, // null = new 侧无此子树
+    old_buf: ?[]u8, // 拥有的内存（释放用）
+    new_buf: ?[]u8,
+    old_pos: usize,
+    new_pos: usize,
+    base_len: usize, // path 前缀在入栈时的长度
+};
+
 /// 两个 tree 的文件级 diff 迭代器。调用方须 `close` 释放。
 pub const TreeDiff = struct {
-    old_walker: ?TreeWalker,
-    new_walker: ?TreeWalker,
-    old_entry: ?WalkEntry,
-    new_entry: ?WalkEntry,
+    reader: *Reader,
+    allocator: Allocator,
+    stack: std.ArrayList(DiffFrame),
+    path: std.ArrayList(u8),
+    old_entry: ?RawEntry,
+    new_entry: ?RawEntry,
 
     /// `old_tree` 为 null 表示全部新增；`new_tree` 为 null 表示全部删除。
     pub fn open(reader: *Reader, allocator: Allocator, old_tree: ?Oid, new_tree: ?Oid) ZightError!TreeDiff {
         var d: TreeDiff = .{
-            .old_walker = null,
-            .new_walker = null,
+            .reader = reader,
+            .allocator = allocator,
+            .stack = .empty,
+            .path = .empty,
             .old_entry = null,
             .new_entry = null,
         };
         errdefer d.close();
-        if (old_tree) |oid| d.old_walker = try TreeWalker.open(reader, allocator, oid);
-        if (new_tree) |oid| d.new_walker = try TreeWalker.open(reader, allocator, oid);
+        try d.pushFrame(old_tree, new_tree, 0);
         return d;
     }
 
     pub fn close(self: *TreeDiff) void {
-        if (self.old_walker) |*w| w.close();
-        if (self.new_walker) |*w| w.close();
+        for (self.stack.items) |*f| {
+            if (f.old_buf) |b| self.allocator.free(b);
+            if (f.new_buf) |b| self.allocator.free(b);
+        }
+        self.stack.deinit(self.allocator);
+        self.path.deinit(self.allocator);
+    }
+
+    fn pushFrame(self: *TreeDiff, old_tree: ?Oid, new_tree: ?Oid, base_len: usize) ZightError!void {
+        var old_buf: ?[]u8 = null;
+        var new_buf: ?[]u8 = null;
+        var old_content: ?[]const u8 = null;
+        var new_content: ?[]const u8 = null;
+
+        errdefer {
+            if (old_buf) |b| self.allocator.free(b);
+            if (new_buf) |b| self.allocator.free(b);
+        }
+
+        if (old_tree) |oid| {
+            var obj = try self.reader.readObject(oid);
+            if (obj.type != .tree) {
+                obj.deinit(self.allocator);
+                return error.MalformedObject;
+            }
+            old_buf = obj.buf;
+            old_content = obj.content;
+            obj.buf = &.{};
+            obj.content = &.{};
+        }
+        if (new_tree) |oid| {
+            var obj = try self.reader.readObject(oid);
+            if (obj.type != .tree) {
+                obj.deinit(self.allocator);
+                return error.MalformedObject;
+            }
+            new_buf = obj.buf;
+            new_content = obj.content;
+            obj.buf = &.{};
+            obj.content = &.{};
+        }
+
+        try self.stack.append(self.allocator, .{
+            .old_content = old_content,
+            .new_content = new_content,
+            .old_buf = old_buf,
+            .new_buf = new_buf,
+            .old_pos = 0,
+            .new_pos = 0,
+            .base_len = base_len,
+        });
     }
 
     /// 拉取下一条变更；无更多变更返回 `null`。
     pub fn next(self: *TreeDiff) ZightError!?FileChange {
-        while (true) {
-            if (self.old_entry == null) self.old_entry = try self.advanceOld();
-            if (self.new_entry == null) self.new_entry = try self.advanceNew();
+        while (self.stack.items.len > 0) {
+            const fi = self.stack.items.len - 1;
+            const frame = &self.stack.items[fi];
 
-            if (self.old_entry == null and self.new_entry == null) return null;
+            if (self.old_entry == null) {
+                if (frame.old_content) |c| self.old_entry = parseEntry(c, &frame.old_pos);
+            }
+            if (self.new_entry == null) {
+                if (frame.new_content) |c| self.new_entry = parseEntry(c, &frame.new_pos);
+            }
+
+            if (self.old_entry == null and self.new_entry == null) {
+                if (frame.old_buf) |b| self.allocator.free(b);
+                if (frame.new_buf) |b| self.allocator.free(b);
+                self.path.shrinkRetainingCapacity(frame.base_len);
+                _ = self.stack.pop();
+                continue;
+            }
 
             if (self.old_entry == null) {
                 const e = self.new_entry.?;
                 self.new_entry = null;
-                return .{ .kind = .added, .path = e.path, .old_oid = null, .new_oid = e.oid };
+                if (e.mode == .directory) {
+                    try self.appendDirAndPush(e.name, null, e.oid);
+                    continue;
+                }
+                try self.setPath(frame.base_len, e.name);
+                return .{ .kind = .added, .path = self.path.items, .old_oid = null, .new_oid = e.oid };
             }
             if (self.new_entry == null) {
                 const e = self.old_entry.?;
                 self.old_entry = null;
-                return .{ .kind = .deleted, .path = e.path, .old_oid = e.oid, .new_oid = null };
+                if (e.mode == .directory) {
+                    try self.appendDirAndPush(e.name, e.oid, null);
+                    continue;
+                }
+                try self.setPath(frame.base_len, e.name);
+                return .{ .kind = .deleted, .path = self.path.items, .old_oid = e.oid, .new_oid = null };
             }
 
             const oe = self.old_entry.?;
             const ne = self.new_entry.?;
-            const cmp = std.mem.order(u8, oe.path, ne.path);
+            const cmp = std.mem.order(u8, oe.name, ne.name);
             if (cmp == .lt) {
                 self.old_entry = null;
-                return .{ .kind = .deleted, .path = oe.path, .old_oid = oe.oid, .new_oid = null };
+                if (oe.mode == .directory) {
+                    try self.appendDirAndPush(oe.name, oe.oid, null);
+                    continue;
+                }
+                try self.setPath(frame.base_len, oe.name);
+                return .{ .kind = .deleted, .path = self.path.items, .old_oid = oe.oid, .new_oid = null };
             } else if (cmp == .gt) {
                 self.new_entry = null;
-                return .{ .kind = .added, .path = ne.path, .old_oid = null, .new_oid = ne.oid };
+                if (ne.mode == .directory) {
+                    try self.appendDirAndPush(ne.name, null, ne.oid);
+                    continue;
+                }
+                try self.setPath(frame.base_len, ne.name);
+                return .{ .kind = .added, .path = self.path.items, .old_oid = null, .new_oid = ne.oid };
             } else {
+                if (oe.mode != ne.mode) {
+                    self.old_entry = null;
+                    if (oe.mode == .directory) {
+                        try self.appendDirAndPush(oe.name, oe.oid, null);
+                        continue;
+                    }
+                    try self.setPath(frame.base_len, oe.name);
+                    return .{ .kind = .deleted, .path = self.path.items, .old_oid = oe.oid, .new_oid = null };
+                }
                 self.old_entry = null;
                 self.new_entry = null;
-                if (!std.mem.eql(u8, &oe.oid.bytes, &ne.oid.bytes)) {
-                    return .{ .kind = .modified, .path = oe.path, .old_oid = oe.oid, .new_oid = ne.oid };
+                if (std.mem.eql(u8, &oe.oid.bytes, &ne.oid.bytes)) continue;
+
+                if (oe.mode == .directory) {
+                    try self.appendDirAndPush(oe.name, oe.oid, ne.oid);
+                    continue;
                 }
+                try self.setPath(frame.base_len, oe.name);
+                return .{ .kind = .modified, .path = self.path.items, .old_oid = oe.oid, .new_oid = ne.oid };
             }
         }
-    }
-
-    fn advanceOld(self: *TreeDiff) ZightError!?WalkEntry {
-        const w = &(self.old_walker orelse return null);
-        while (try w.next()) |entry| {
-            if (entry.mode == .directory) continue;
-            return entry;
-        }
         return null;
     }
 
-    fn advanceNew(self: *TreeDiff) ZightError!?WalkEntry {
-        const w = &(self.new_walker orelse return null);
-        while (try w.next()) |entry| {
-            if (entry.mode == .directory) continue;
-            return entry;
-        }
-        return null;
+    fn setPath(self: *TreeDiff, base_len: usize, name: []const u8) ZightError!void {
+        self.path.shrinkRetainingCapacity(base_len);
+        self.path.appendSlice(self.allocator, name) catch return error.OutOfMemory;
+    }
+
+    fn appendDirAndPush(self: *TreeDiff, name: []const u8, old_oid: ?Oid, new_oid: ?Oid) ZightError!void {
+        const frame = &self.stack.items[self.stack.items.len - 1];
+        const saved = frame.base_len;
+        self.path.shrinkRetainingCapacity(saved);
+        self.path.appendSlice(self.allocator, name) catch return error.OutOfMemory;
+        errdefer self.path.shrinkRetainingCapacity(saved);
+        self.path.append(self.allocator, '/') catch return error.OutOfMemory;
+        try self.pushFrame(old_oid, new_oid, self.path.items.len);
     }
 };
 
