@@ -53,6 +53,7 @@ pub fn readLoose(repo: *Repo, oid: Oid) ZightError!Object {
 
     const compressed = repo.readGitFile(path, .limited(repo.limits.loose_object_max)) catch |err| switch (err) {
         error.NotFound => return error.NotFound,
+        error.StreamTooLong => return error.LimitExceeded,
         else => |e| return e,
     };
     defer repo.allocator.free(compressed);
@@ -145,6 +146,16 @@ test "readLoose missing returns NotFound" {
     defer repo.close();
     const oid = Oid.fromHex("0000000000000000000000000000000000000000") catch unreachable;
     try std.testing.expectError(error.NotFound, readLoose(&repo, oid));
+}
+
+test "readLoose returns LimitExceeded when compressed file exceeds limit" {
+    // rule.md §5.2: 超限返回 LimitExceeded。readLoose 用 .limited(loose_object_max)
+    // 读取压缩文件，超限时 readGitFile 透传 StreamTooLong，未映射为 LimitExceeded。
+    var repo = try openFixture("tiny");
+    defer repo.close();
+    repo.limits.loose_object_max = 10;
+    const oid = try headOid(&repo);
+    try std.testing.expectError(error.LimitExceeded, readLoose(&repo, oid));
 }
 
 test "loosePath format" {

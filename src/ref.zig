@@ -49,9 +49,6 @@ pub fn resolveRef(repo: *Repo, name: []const u8) ZightError!Oid {
     defer if (prev_ref) |*r| r.deinit(repo.allocator);
 
     while (true) {
-        depth += 1;
-        if (depth > MAX_SYMREF_DEPTH) return error.SymrefTooDeep;
-
         var ref = (try readRef(repo, current)) orelse return error.NotFound;
         switch (ref) {
             .oid => |o| {
@@ -59,6 +56,11 @@ pub fn resolveRef(repo: *Repo, name: []const u8) ZightError!Oid {
                 return o;
             },
             .symref => |target| {
+                depth += 1;
+                if (depth > MAX_SYMREF_DEPTH) {
+                    ref.deinit(repo.allocator);
+                    return error.SymrefTooDeep;
+                }
                 if (prev_ref) |*r| r.deinit(repo.allocator);
                 prev_ref = ref;
                 current = target;
@@ -223,6 +225,16 @@ test "resolveRef deep symref chain returns SymrefTooDeep" {
     var repo = try openFixture("edge");
     defer repo.close();
     try std.testing.expectError(error.SymrefTooDeep, resolveRef(&repo, "refs/chain/a"));
+}
+
+test "resolveRef: 5-layer symref chain resolves (boundary)" {
+    // rule.md §4.2: symref 链最大深度 5。5 层 symref + oid 应放行。
+    // 当前实现 depth 在 readRef 前递增，5 层 symref 需 6 次 readRef，
+    // depth=6 > MAX_SYMREF_DEPTH(5) 被误拒为 SymrefTooDeep。
+    var repo = try openFixture("edge");
+    defer repo.close();
+    const oid = try resolveRef(&repo, "refs/chain5/a");
+    try std.testing.expect(!oid.isZero());
 }
 
 test "packed-refs lookup via merge fixture" {

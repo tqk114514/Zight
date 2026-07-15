@@ -184,6 +184,16 @@ printf "ref: refs/chain/f\n" > .git/refs/chain/e
 printf "ref: refs/chain/g\n" > .git/refs/chain/f
 printf "%s\n" "$HEAD_OID" > .git/refs/chain/g
 
+# 5 层 symref + oid（边界用例：恰好 max_symref_depth=5，应放行）
+# refs/chain5/a → b → c → d → e → f → oid（5 层 symref）
+mkdir -p .git/refs/chain5
+printf "ref: refs/chain5/b\n" > .git/refs/chain5/a
+printf "ref: refs/chain5/c\n" > .git/refs/chain5/b
+printf "ref: refs/chain5/d\n" > .git/refs/chain5/c
+printf "ref: refs/chain5/e\n" > .git/refs/chain5/d
+printf "ref: refs/chain5/f\n" > .git/refs/chain5/e
+printf "%s\n" "$HEAD_OID" > .git/refs/chain5/f
+
 rm -rf .git/hooks
 
 # --- malformed：畸形 loose 对象 fixture（reader pub API 切片越界 panic 复现）---
@@ -203,3 +213,5 @@ printf "tree abc" | git hash-object --literally -t commit -w --stdin >/dev/null
 printf "parent abc" | git hash-object --literally -t commit -w --stdin >/dev/null
 # 畸形 tag content="object abc"（行长 10 < 47，触发 peelToCommit 切片越界）
 printf "object abc" | git hash-object --literally -t tag -w --stdin >/dev/null
+
+

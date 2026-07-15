@@ -52,11 +52,12 @@ pub fn validateRefName(name: []const u8) PathError!void {
     }
     if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidPath;
     if (std.mem.indexOfScalar(u8, name, '\\') != null) return error.InvalidPath;
-    if (name[0] == '-' or name[0] == '/') return error.InvalidPath;
+    if (name[0] == '-' or name[0] == '/' or name[0] == '.') return error.InvalidPath;
     if (name[name.len - 1] == '/' or name[name.len - 1] == '.') return error.InvalidPath;
+    if (std.mem.eql(u8, name, "@")) return error.InvalidPath;
+    if (std.mem.endsWith(u8, name, ".lock")) return error.InvalidPath;
     if (std.mem.indexOf(u8, name, "..") != null) return error.InvalidPath;
     if (std.mem.indexOf(u8, name, "/.") != null) return error.InvalidPath;
-    if (name.len >= 2 and std.mem.eql(u8, name[0..2], "./")) return error.InvalidPath;
 
     for (name) |c| {
         if (c < 0x20 or c == 0x7f) return error.InvalidPath;
@@ -119,4 +120,20 @@ test "validateRelative: 'a:b' should be valid relative path" {
 test "validateRefName: rejects trailing dot" {
     // git refman: refname 不能以 '.' 结尾。
     try std.testing.expectError(error.InvalidPath, validateRefName("refs/heads/main."));
+}
+
+test "validateRefName: rejects leading dot (non './')" {
+    // git refman: refname 不能以 '.' 开头。当前只拒绝 './' 前缀，
+    // 漏掉了 '.hidden' 这类以 '.' 开头但第二字符非 '/' 的 ref 名。
+    try std.testing.expectError(error.InvalidPath, validateRefName(".hidden"));
+}
+
+test "validateRefName: rejects single '@'" {
+    // git refman: refname 不能是单独的 '@'（HEAD 的简写）。
+    try std.testing.expectError(error.InvalidPath, validateRefName("@"));
+}
+
+test "validateRefName: rejects '.lock' suffix" {
+    // git refman: refname 不能以 '.lock' 结尾（与 lock 文件冲突）。
+    try std.testing.expectError(error.InvalidPath, validateRefName("refs/heads/foo.lock"));
 }
