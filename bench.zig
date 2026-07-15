@@ -105,9 +105,14 @@ pub fn main() !void {
         defer if (target_path) |p| allocator.free(p);
 
         // 构建索引
-        zight.index.build(&reader, &repo, allocator) catch |err| {
-            std.debug.print("index build failed: {}\n", .{err});
-        };
+        {
+            const start = nowTs(io);
+            zight.index.build(&reader, &repo, allocator) catch |err| {
+                std.debug.print("index build failed: {}\n", .{err});
+            };
+            const elapsed = elapsedMs(io, start);
+            std.debug.print("5.  index build: {d:.3} ms  [context]\n", .{elapsed});
+        }
         var idx_opt = zight.index.open(&repo, allocator) catch null;
         defer if (idx_opt) |*idx| idx.deinit();
 
