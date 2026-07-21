@@ -1,6 +1,6 @@
 .{
     .name = .zight,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x84ba3ed5af8e0ad3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

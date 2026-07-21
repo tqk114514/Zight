@@ -21,16 +21,17 @@ fn elapsedMs(io: Io, start: Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const repo_path = "D:\\Project\\NebulaStudios-Website";
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
+    _ = args.skip();
+    const repo_path = args.next() orelse {
+        std.debug.print("usage: bench <repo_path>\n", .{});
+        return;
+    };
 
     var repo = zight.Repo.open(io, allocator, repo_path) catch |err| {
         std.debug.print("open failed: {}\n", .{err});
