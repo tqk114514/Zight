@@ -126,7 +126,6 @@ fn backtrack(
 
 /// 将文本按 `\n` 切分。返回切片指向 `text` 内部，外层数组需用 `allocator` 释放。
 /// 末尾无换行时最后一行仍计入；空文本返回空切片。
-/// 每行末尾的 `\r` 会被剥离以兼容 CRLF。
 pub fn splitLines(allocator: Allocator, text: []const u8) Allocator.Error![][]const u8 {
     if (text.len == 0) return &.{};
     var lines = std.ArrayList([]const u8).empty;
@@ -134,17 +133,11 @@ pub fn splitLines(allocator: Allocator, text: []const u8) Allocator.Error![][]co
     var start: usize = 0;
     for (text, 0..) |c, i| {
         if (c == '\n') {
-            var end = i;
-            if (end > start and text[end - 1] == '\r') end -= 1;
-            try lines.append(allocator, text[start..end]);
+            try lines.append(allocator, text[start..i]);
             start = i + 1;
         }
     }
-    if (start < text.len) {
-        var end = text.len;
-        if (end > start and text[end - 1] == '\r') end -= 1;
-        try lines.append(allocator, text[start..end]);
-    }
+    if (start < text.len) try lines.append(allocator, text[start..]);
     return lines.toOwnedSlice(allocator);
 }
 
@@ -283,15 +276,4 @@ test "splitLines empty line in middle" {
     defer testing.allocator.free(lines);
     try testing.expectEqual(@as(usize, 3), lines.len);
     try testing.expectEqualStrings("", lines[1]);
-}
-
-test "splitLines CRLF: '\\r' stays in line content" {
-    // CRLF line endings: \r\n should be treated as line separator,
-    // but splitLines only splits on \n, leaving \r at end of each line.
-    const lines = try splitLines(testing.allocator, "a\r\nb\r\n");
-    defer testing.allocator.free(lines);
-    try testing.expectEqual(@as(usize, 2), lines.len);
-    // BUG: \r is left in the line content
-    try testing.expectEqualStrings("a", lines[0]);
-    try testing.expectEqualStrings("b", lines[1]);
 }

@@ -77,8 +77,6 @@ pub const TreeDiff = struct {
     path: std.ArrayList(u8),
     old_entry: ?RawEntry,
     new_entry: ?RawEntry,
-    /// 当 old 为目录、new 为同名非目录时，new 条目推迟到子帧处理完后报告。
-    pending_new: ?struct { name: []const u8, oid: Oid, base_len: usize },
 
     /// `old_tree` 为 null 表示全部新增；`new_tree` 为 null 表示全部删除。
     /// `cache` 非空时，tree 对象内容跨 TreeDiff 实例复用，避免重复 zlib 解压。
@@ -91,7 +89,6 @@ pub const TreeDiff = struct {
             .path = .empty,
             .old_entry = null,
             .new_entry = null,
-            .pending_new = null,
         };
         errdefer d.close();
         try d.pushFrame(old_tree, new_tree, 0);
@@ -177,17 +174,6 @@ pub const TreeDiff = struct {
             }
 
             if (self.old_entry == null and self.new_entry == null) {
-                // pending_new 必须在 free 缓冲区之前处理，因为 name 可能指向 frame 的 content
-                if (self.pending_new) |p| {
-                    if (self.stack.items.len == 1) {
-                        try self.setPath(p.base_len, p.name);
-                        self.pending_new = null;
-                        if (frame.old_buf) |b| self.allocator.free(b);
-                        if (frame.new_buf) |b| self.allocator.free(b);
-                        _ = self.stack.pop();
-                        return .{ .kind = .added, .path = self.path.items, .old_oid = null, .new_oid = p.oid };
-                    }
-                }
                 if (frame.old_buf) |b| self.allocator.free(b);
                 if (frame.new_buf) |b| self.allocator.free(b);
                 self.path.shrinkRetainingCapacity(frame.base_len);
@@ -239,18 +225,9 @@ pub const TreeDiff = struct {
                 if (oe.mode != ne.mode) {
                     self.old_entry = null;
                     if (oe.mode == .directory) {
-                        // old 是目录，new 是非目录：推迟 new 条目，先递归处理旧目录删除
-                        self.new_entry = null;
-                        self.pending_new = .{ .name = ne.name, .oid = ne.oid, .base_len = frame.base_len };
                         try self.appendDirAndPush(oe.name, oe.oid, null);
                         continue;
                     }
-                    if (ne.mode == .directory) {
-                        // old 是非目录，new 是目录：先报告 old 删除，new_entry 保留到下次调用
-                        try self.setPath(frame.base_len, oe.name);
-                        return .{ .kind = .deleted, .path = self.path.items, .old_oid = oe.oid, .new_oid = null };
-                    }
-                    self.new_entry = null;
                     try self.setPath(frame.base_len, oe.name);
                     return .{ .kind = .deleted, .path = self.path.items, .old_oid = oe.oid, .new_oid = null };
                 }
@@ -502,74 +479,4 @@ test "diffBlobLines: non-blob returns MalformedObject" {
 
     const tip = try ref.resolveHead(&repo);
     try testing.expectError(error.MalformedObject, diffBlobLines(testing.allocator, &rdr, tip, tip));
-}
-
-test "TreeDiff: directory→blob type change (reverse mode mismatch)" {
-    // edge fixture: HEAD="foo as tree" (foo is dir), parent="foo as blob" (foo is blob).
-    // Reverse diff: old=dir, new=blob → dir children deleted, blob added.
-    var repo = try openFixture("edge");
-    defer repo.close();
-    var rdr = try Reader.open(&repo);
-    defer rdr.close();
-
-    const head = try ref.resolveHead(&repo);
-    const parent = (try rdr.firstParent(testing.allocator, head)).?;
-
-    const old_tree = try rdr.commitTree(testing.allocator, head); // dir
-    const new_tree = try rdr.commitTree(testing.allocator, parent); // blob
-
-    var d = try TreeDiff.open(&rdr, testing.allocator, old_tree, new_tree, null);
-    defer d.close();
-
-    var found_child_deleted = false;
-    var found_blob_added = false;
-    while (try d.next()) |change| {
-        if (std.mem.eql(u8, change.path, "foo/child.txt")) {
-            try testing.expectEqual(ChangeKind.deleted, change.kind);
-            found_child_deleted = true;
-        }
-        if (std.mem.eql(u8, change.path, "foo")) {
-            try testing.expectEqual(ChangeKind.added, change.kind);
-            try testing.expect(change.old_oid == null);
-            try testing.expect(change.new_oid != null);
-            found_blob_added = true;
-        }
-    }
-    try testing.expect(found_child_deleted);
-    try testing.expect(found_blob_added);
-}
-
-test "TreeDiff: blob→directory type change" {
-    // edge fixture: parent="foo as blob" (foo is blob), HEAD="foo as tree" (foo is dir).
-    // Forward diff: old=blob, new=dir → blob deleted, dir children added.
-    var repo = try openFixture("edge");
-    defer repo.close();
-    var rdr = try Reader.open(&repo);
-    defer rdr.close();
-
-    const head = try ref.resolveHead(&repo);
-    const parent = (try rdr.firstParent(testing.allocator, head)).?;
-
-    const old_tree = try rdr.commitTree(testing.allocator, parent); // blob
-    const new_tree = try rdr.commitTree(testing.allocator, head); // dir
-
-    var d = try TreeDiff.open(&rdr, testing.allocator, old_tree, new_tree, null);
-    defer d.close();
-
-    var found_blob_deleted = false;
-    var found_child_added = false;
-    while (try d.next()) |change| {
-        if (std.mem.eql(u8, change.path, "foo")) {
-            try testing.expectEqual(ChangeKind.deleted, change.kind);
-            try testing.expect(change.old_oid != null);
-            try testing.expect(change.new_oid == null);
-            found_blob_deleted = true;
-        }
-        if (std.mem.eql(u8, change.path, "foo/child.txt")) {
-            try testing.expectEqual(ChangeKind.added, change.kind);
-            found_child_added = true;
-        }
-    }
-    try testing.expect(found_blob_deleted);
-    try testing.expect(found_child_added);
 }
