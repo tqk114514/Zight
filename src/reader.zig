@@ -21,10 +21,54 @@ const delta = @import("delta.zig");
 const Repo = @import("repo.zig").Repo;
 const ZightError = @import("error.zig").ZightError;
 
+const CachedObj = struct {
+    type: ObjectType,
+    data: []u8,
+};
+
+/// pack 对象缓存。按 (pack_idx, offset) 缓存已解析的对象内容（含 delta 解析结果）。
+/// 用于 index build 时避免重复解析同一 delta 链。`allocator` 应为不 reset 的 arena。
+/// 调用方须 `deinit` 释放。
+pub const ObjectCache = struct {
+    maps: []std.AutoHashMap(u64, CachedObj),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, pack_count: usize) ZightError!ObjectCache {
+        const maps = allocator.alloc(std.AutoHashMap(u64, CachedObj), pack_count) catch return error.OutOfMemory;
+        for (maps) |*m| m.* = .init(allocator);
+        return .{ .maps = maps, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ObjectCache) void {
+        for (self.maps) |*m| {
+            var it = m.iterator();
+            while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+            m.deinit();
+        }
+        self.allocator.free(self.maps);
+    }
+
+    pub fn get(self: *ObjectCache, pack_idx: usize, offset: u64) ?CachedObj {
+        return self.maps[pack_idx].get(offset);
+    }
+
+    pub fn put(self: *ObjectCache, pack_idx: usize, offset: u64, obj: CachedObj) ZightError!void {
+        self.maps[pack_idx].put(offset, obj) catch return error.OutOfMemory;
+    }
+};
+
+fn storeCached(c: *ObjectCache, pk_idx: usize, offset: u64, obj_type: ObjectType, data: []const u8) void {
+    const dup = c.allocator.dupe(u8, data) catch return;
+    c.put(pk_idx, offset, .{ .type = obj_type, .data = dup }) catch {
+        c.allocator.free(dup);
+    };
+}
+
 /// 仓库对象读取器。持有所有 packfile 句柄，调用方须 `close` 释放。
 pub const Reader = struct {
     repo: *Repo,
     packs: []Pack,
+    ocache: ?*ObjectCache = null,
 
     /// 打开 `repo` 下所有 packfile。无 pack 目录时返回空 packs。
     pub fn open(repo: *Repo) ZightError!Reader {
@@ -68,30 +112,35 @@ pub const Reader = struct {
         self.repo.allocator.free(self.packs);
     }
 
-    /// 读取 `oid` 对应的对象。先查 loose，再查所有 pack。
+    /// 读取 `oid` 对应的对象。先查 pack，再查 loose。
     /// `allocator` 决定返回 `Object.buf` 的分配，调用方须用同一 `allocator` 调 `deinit`。
     pub fn readObject(self: *Reader, allocator: Allocator, oid: Oid) ZightError!Object {
         return self.readObjectInternal(allocator, oid, 0);
     }
 
     fn readObjectInternal(self: *Reader, allocator: Allocator, oid: Oid, depth: u32) ZightError!Object {
-        if (object.readLoose(self.repo, allocator, oid)) |obj| {
-            return obj;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => |e| return e,
-        }
-
-        for (self.packs) |*pk| {
+        for (self.packs, 0..) |*pk, i| {
             if (pk.findOffset(oid)) |offset| {
-                return self.resolvePackObject(allocator, pk, offset, depth);
+                return self.resolvePackObject(allocator, i, offset, depth);
             }
         }
 
-        return error.NotFound;
+        return object.readLoose(self.repo, allocator, oid) catch |err| switch (err) {
+            error.NotFound => error.NotFound,
+            else => |e| e,
+        };
     }
 
-    fn resolvePackObject(self: *Reader, allocator: Allocator, pk: *Pack, offset: u64, depth: u32) ZightError!Object {
+    fn resolvePackObject(self: *Reader, allocator: Allocator, pk_idx: usize, offset: u64, depth: u32) ZightError!Object {
+        const pk = &self.packs[pk_idx];
+
+        if (self.ocache) |c| {
+            if (c.get(pk_idx, offset)) |cached| {
+                const dup = allocator.dupe(u8, cached.data) catch return error.OutOfMemory;
+                return .{ .type = cached.type, .buf = dup, .content = dup };
+            }
+        }
+
         if (depth >= self.repo.limits.delta_depth_max) return error.LimitExceeded;
 
         var raw = pk.readRaw(allocator, offset) catch |err| return mapPackError(err);
@@ -104,6 +153,9 @@ pub const Reader = struct {
                 .tag => .tag,
                 else => unreachable, // isDelta 已过滤 ofs_delta/ref_delta
             };
+            if (self.ocache) |c| {
+                storeCached(c, pk_idx, offset, obj_type, raw.data);
+            }
             return .{
                 .type = obj_type,
                 .buf = raw.data,
@@ -114,7 +166,7 @@ pub const Reader = struct {
         defer allocator.free(raw.data);
 
         var base_obj: Object = if (raw.base_offset) |bo|
-            try self.resolvePackObject(allocator, pk, bo, depth + 1)
+            try self.resolvePackObject(allocator, pk_idx, bo, depth + 1)
         else if (raw.base_oid) |boid|
             try self.readObjectInternal(allocator, boid, depth + 1)
         else
@@ -132,6 +184,10 @@ pub const Reader = struct {
             error.MalformedDelta => error.MalformedObject,
             error.DeltaSizeMismatch => error.CorruptedObject,
         };
+
+        if (self.ocache) |c| {
+            storeCached(c, pk_idx, offset, base_obj.type, target);
+        }
 
         return .{
             .type = base_obj.type,

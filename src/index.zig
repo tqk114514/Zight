@@ -15,6 +15,7 @@ const Oid = hash.Oid;
 const Sha1Hasher = hash.Sha1Hasher;
 const Repo = @import("repo.zig").Repo;
 const Reader = @import("reader.zig").Reader;
+const ObjectCache = @import("reader.zig").ObjectCache;
 const ref = @import("ref.zig");
 const diff = @import("diff.zig");
 const bloom_mod = @import("bloom.zig");
@@ -143,14 +144,18 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
         stack.append(allocator, commit_oid) catch return error.OutOfMemory;
     }
 
-    // 临时数据（commit 内容、tree diff buf、paths）用 arena，每轮循环末尾 reset；
-    // 永久数据（parents、bloom.bits）用主 allocator，保留到 serializeBuffer。
-    // tree 对象内容跨 commit 复用（TreeCache），避免重复 zlib 解压。
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    var cache_arena = std.heap.ArenaAllocator.init(allocator);
+    defer cache_arena.deinit();
 
-    var tree_cache = diff.TreeCache.init(allocator);
+    var tree_cache = diff.TreeCache.init(cache_arena.allocator());
     defer tree_cache.deinit();
+
+    var ocache = ObjectCache.init(cache_arena.allocator(), reader.packs.len) catch return error.OutOfMemory;
+    defer ocache.deinit();
+    reader.ocache = &ocache;
+    defer reader.ocache = null;
 
     while (stack.items.len > 0) {
         const oid = stack.items[stack.items.len - 1];
@@ -187,7 +192,6 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
     }
 
     std.mem.sort(BuildEntry, entries.items, {}, buildEntryOidLessThan);
-
     return serializeBuffer(allocator, &digest, entries.items);
 }
 

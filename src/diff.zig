@@ -167,10 +167,14 @@ pub const TreeDiff = struct {
             const frame = &self.stack.items[fi];
 
             if (self.old_entry == null) {
-                if (frame.old_content) |c| self.old_entry = parseEntry(c, &frame.old_pos);
+                if (frame.old_content) |c| {
+                    self.old_entry = parseEntry(c, &frame.old_pos);
+                }
             }
             if (self.new_entry == null) {
-                if (frame.new_content) |c| self.new_entry = parseEntry(c, &frame.new_pos);
+                if (frame.new_content) |c| {
+                    self.new_entry = parseEntry(c, &frame.new_pos);
+                }
             }
 
             if (self.old_entry == null and self.new_entry == null) {

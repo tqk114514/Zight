@@ -118,13 +118,41 @@ fn appendCopyOp(list: *std.ArrayList(u8), offset: u32, size: u32) !void {
     var op: u8 = 0x80;
     var buf: [7]u8 = undefined;
     var n: usize = 0;
-    if (offset & 0xff != 0) { op |= 0x01; buf[n] = @intCast(offset & 0xff); n += 1; }
-    if (offset & 0xff00 != 0) { op |= 0x02; buf[n] = @intCast((offset >> 8) & 0xff); n += 1; }
-    if (offset & 0xff0000 != 0) { op |= 0x04; buf[n] = @intCast((offset >> 16) & 0xff); n += 1; }
-    if (offset & 0xff000000 != 0) { op |= 0x08; buf[n] = @intCast((offset >> 24) & 0xff); n += 1; }
-    if (size & 0xff != 0) { op |= 0x10; buf[n] = @intCast(size & 0xff); n += 1; }
-    if (size & 0xff00 != 0) { op |= 0x20; buf[n] = @intCast((size >> 8) & 0xff); n += 1; }
-    if (size & 0xff0000 != 0) { op |= 0x40; buf[n] = @intCast((size >> 16) & 0xff); n += 1; }
+    if (offset & 0xff != 0) {
+        op |= 0x01;
+        buf[n] = @intCast(offset & 0xff);
+        n += 1;
+    }
+    if (offset & 0xff00 != 0) {
+        op |= 0x02;
+        buf[n] = @intCast((offset >> 8) & 0xff);
+        n += 1;
+    }
+    if (offset & 0xff0000 != 0) {
+        op |= 0x04;
+        buf[n] = @intCast((offset >> 16) & 0xff);
+        n += 1;
+    }
+    if (offset & 0xff000000 != 0) {
+        op |= 0x08;
+        buf[n] = @intCast((offset >> 24) & 0xff);
+        n += 1;
+    }
+    if (size & 0xff != 0) {
+        op |= 0x10;
+        buf[n] = @intCast(size & 0xff);
+        n += 1;
+    }
+    if (size & 0xff00 != 0) {
+        op |= 0x20;
+        buf[n] = @intCast((size >> 8) & 0xff);
+        n += 1;
+    }
+    if (size & 0xff0000 != 0) {
+        op |= 0x40;
+        buf[n] = @intCast((size >> 16) & 0xff);
+        n += 1;
+    }
     try list.append(testing.allocator, op);
     try list.appendSlice(testing.allocator, buf[0..n]);
 }
