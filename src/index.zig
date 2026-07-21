@@ -145,8 +145,12 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
 
     // 临时数据（commit 内容、tree diff buf、paths）用 arena，每轮循环末尾 reset；
     // 永久数据（parents、bloom.bits）用主 allocator，保留到 serializeBuffer。
+    // tree 对象内容跨 commit 复用（TreeCache），避免重复 zlib 解压。
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+
+    var tree_cache = diff.TreeCache.init(allocator);
+    defer tree_cache.deinit();
 
     while (stack.items.len > 0) {
         const oid = stack.items[stack.items.len - 1];
@@ -159,7 +163,7 @@ pub fn buildToBuffer(reader: *Reader, repo: *Repo, allocator: Allocator) ZightEr
 
         var bl: Bloom = if (parents.len > 0) blk: {
             const parent_tree = try reader.commitTree(arena_alloc, parents[0]);
-            const paths = try collectChangedPaths(arena_alloc, reader, parent_tree, meta.tree);
+            const paths = try collectChangedPaths(arena_alloc, reader, parent_tree, meta.tree, &tree_cache);
             break :blk try bloom_mod.build(allocator, paths);
         } else .{ .bits = &.{}, .bit_count = 0 };
         errdefer bl.deinit(allocator);
@@ -260,14 +264,14 @@ fn computeRefTipsDigest(repo: *Repo, allocator: Allocator) ZightError![20]u8 {
     return digest;
 }
 
-fn collectChangedPaths(allocator: Allocator, reader: *Reader, old_tree: Oid, new_tree: Oid) ZightError![][]u8 {
+fn collectChangedPaths(allocator: Allocator, reader: *Reader, old_tree: Oid, new_tree: Oid, cache: ?*diff.TreeCache) ZightError![][]u8 {
     var paths: std.ArrayList([]u8) = .empty;
     errdefer {
         for (paths.items) |p| allocator.free(p);
         paths.deinit(allocator);
     }
 
-    var d = try diff.TreeDiff.open(reader, allocator, old_tree, new_tree);
+    var d = try diff.TreeDiff.open(reader, allocator, old_tree, new_tree, cache);
     defer d.close();
     while (try d.next()) |change| {
         const p = allocator.dupe(u8, change.path) catch return error.OutOfMemory;

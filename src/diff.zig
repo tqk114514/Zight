@@ -28,6 +28,36 @@ pub const FileChange = struct {
     new_oid: ?Oid, // null for deleted
 };
 
+/// tree 对象缓存。oid → 解压后内容。跨多次 TreeDiff 复用，避免重复 zlib 解压。
+/// 调用方须 `deinit` 释放。
+pub const TreeCache = struct {
+    map: std.AutoHashMap([20]u8, CachedTree),
+    allocator: Allocator,
+
+    const CachedTree = struct {
+        buf: []u8,
+        content: []const u8,
+    };
+
+    pub fn init(allocator: Allocator) TreeCache {
+        return .{ .map = .init(allocator), .allocator = allocator };
+    }
+
+    pub fn deinit(self: *TreeCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.value_ptr.buf);
+        self.map.deinit();
+    }
+
+    pub fn get(self: *TreeCache, oid: Oid) ?[]const u8 {
+        return if (self.map.get(oid.bytes)) |c| c.content else null;
+    }
+
+    pub fn put(self: *TreeCache, oid: Oid, buf: []u8, content: []const u8) !void {
+        try self.map.put(oid.bytes, .{ .buf = buf, .content = content });
+    }
+};
+
 const DiffFrame = struct {
     old_content: ?[]const u8, // null = old 侧无此子树
     new_content: ?[]const u8, // null = new 侧无此子树
@@ -42,16 +72,19 @@ const DiffFrame = struct {
 pub const TreeDiff = struct {
     reader: *Reader,
     allocator: Allocator,
+    cache: ?*TreeCache,
     stack: std.ArrayList(DiffFrame),
     path: std.ArrayList(u8),
     old_entry: ?RawEntry,
     new_entry: ?RawEntry,
 
     /// `old_tree` 为 null 表示全部新增；`new_tree` 为 null 表示全部删除。
-    pub fn open(reader: *Reader, allocator: Allocator, old_tree: ?Oid, new_tree: ?Oid) ZightError!TreeDiff {
+    /// `cache` 非空时，tree 对象内容跨 TreeDiff 实例复用，避免重复 zlib 解压。
+    pub fn open(reader: *Reader, allocator: Allocator, old_tree: ?Oid, new_tree: ?Oid, cache: ?*TreeCache) ZightError!TreeDiff {
         var d: TreeDiff = .{
             .reader = reader,
             .allocator = allocator,
+            .cache = cache,
             .stack = .empty,
             .path = .empty,
             .old_entry = null,
@@ -71,6 +104,37 @@ pub const TreeDiff = struct {
         self.path.deinit(self.allocator);
     }
 
+    fn loadTree(self: *TreeDiff, oid: Oid, out_buf: *?[]u8, out_content: *?[]const u8) ZightError!void {
+        if (self.cache) |c| {
+            if (c.get(oid)) |cached| {
+                out_content.* = cached;
+                return;
+            }
+            var obj = try self.reader.readObject(c.allocator, oid);
+            if (obj.type != .tree) {
+                obj.deinit(c.allocator);
+                return error.MalformedObject;
+            }
+            c.put(oid, obj.buf, obj.content) catch {
+                obj.deinit(c.allocator);
+                return error.OutOfMemory;
+            };
+            out_content.* = obj.content;
+            obj.buf = &.{};
+            obj.content = &.{};
+            return;
+        }
+        var obj = try self.reader.readObject(self.allocator, oid);
+        if (obj.type != .tree) {
+            obj.deinit(self.allocator);
+            return error.MalformedObject;
+        }
+        out_buf.* = obj.buf;
+        out_content.* = obj.content;
+        obj.buf = &.{};
+        obj.content = &.{};
+    }
+
     fn pushFrame(self: *TreeDiff, old_tree: ?Oid, new_tree: ?Oid, base_len: usize) ZightError!void {
         var old_buf: ?[]u8 = null;
         var new_buf: ?[]u8 = null;
@@ -82,28 +146,8 @@ pub const TreeDiff = struct {
             if (new_buf) |b| self.allocator.free(b);
         }
 
-        if (old_tree) |oid| {
-            var obj = try self.reader.readObject(self.allocator, oid);
-            if (obj.type != .tree) {
-                obj.deinit(self.allocator);
-                return error.MalformedObject;
-            }
-            old_buf = obj.buf;
-            old_content = obj.content;
-            obj.buf = &.{};
-            obj.content = &.{};
-        }
-        if (new_tree) |oid| {
-            var obj = try self.reader.readObject(self.allocator, oid);
-            if (obj.type != .tree) {
-                obj.deinit(self.allocator);
-                return error.MalformedObject;
-            }
-            new_buf = obj.buf;
-            new_content = obj.content;
-            obj.buf = &.{};
-            obj.content = &.{};
-        }
+        if (old_tree) |oid| try self.loadTree(oid, &old_buf, &old_content);
+        if (new_tree) |oid| try self.loadTree(oid, &new_buf, &new_content);
 
         try self.stack.append(self.allocator, .{
             .old_content = old_content,
@@ -260,7 +304,7 @@ test "TreeDiff: added file (initial → add nested)" {
     const old_tree = try rdr.commitTree(testing.allocator, parent);
     const new_tree = try rdr.commitTree(testing.allocator, tip);
 
-    var d = try TreeDiff.open(&rdr, testing.allocator, old_tree, new_tree);
+    var d = try TreeDiff.open(&rdr, testing.allocator, old_tree, new_tree, null);
     defer d.close();
 
     var added_nested = false;
@@ -289,7 +333,7 @@ test "TreeDiff: deleted file (reverse)" {
     const old_tree = try rdr.commitTree(testing.allocator, tip);
     const new_tree = try rdr.commitTree(testing.allocator, parent);
 
-    var d = try TreeDiff.open(&rdr, testing.allocator, old_tree, new_tree);
+    var d = try TreeDiff.open(&rdr, testing.allocator, old_tree, new_tree, null);
     defer d.close();
 
     var deleted_nested = false;
@@ -313,7 +357,7 @@ test "TreeDiff: identical trees yield no changes" {
     const tip = try ref.resolveHead(&repo);
     const tree = try rdr.commitTree(testing.allocator, tip);
 
-    var d = try TreeDiff.open(&rdr, testing.allocator, tree, tree);
+    var d = try TreeDiff.open(&rdr, testing.allocator, tree, tree, null);
     defer d.close();
 
     while (try d.next()) |_| {
@@ -330,7 +374,7 @@ test "TreeDiff: null old tree (all added)" {
     const tip = try ref.resolveHead(&repo);
     const tree = try rdr.commitTree(testing.allocator, tip);
 
-    var d = try TreeDiff.open(&rdr, testing.allocator, null, tree);
+    var d = try TreeDiff.open(&rdr, testing.allocator, null, tree, null);
     defer d.close();
 
     var count: usize = 0;
@@ -350,7 +394,7 @@ test "TreeDiff: null new tree (all deleted)" {
     const tip = try ref.resolveHead(&repo);
     const tree = try rdr.commitTree(testing.allocator, tip);
 
-    var d = try TreeDiff.open(&rdr, testing.allocator, tree, null);
+    var d = try TreeDiff.open(&rdr, testing.allocator, tree, null, null);
     defer d.close();
 
     var count: usize = 0;
@@ -402,7 +446,7 @@ test "TreeDiff: both null trees" {
     var rdr = try Reader.open(&repo);
     defer rdr.close();
 
-    var d = try TreeDiff.open(&rdr, testing.allocator, null, null);
+    var d = try TreeDiff.open(&rdr, testing.allocator, null, null, null);
     defer d.close();
 
     const result = try d.next();
