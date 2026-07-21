@@ -26,40 +26,60 @@ const CachedObj = struct {
     data: []u8,
 };
 
-/// pack 对象缓存。按 (pack_idx, offset) 缓存已解析的对象内容（含 delta 解析结果）。
-/// 用于 index build 时避免重复解析同一 delta 链。`allocator` 应为不 reset 的 arena。
-/// 调用方须 `deinit` 释放。
+/// 对象缓存。两层：
+/// - `by_oid`：oid → 对象，覆盖 loose + pack 顶层读取（未 gc 仓库也命中）
+/// - `by_offset`：(pack_idx, offset) → 对象，覆盖 pack delta 链中间对象（oid 未知）
+/// `allocator` 应为不 reset 的 arena。调用方须 `deinit` 释放。
 pub const ObjectCache = struct {
-    maps: []std.AutoHashMap(u64, CachedObj),
+    by_oid: std.AutoHashMap([20]u8, CachedObj),
+    by_offset: []std.AutoHashMap(u64, CachedObj),
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, pack_count: usize) ZightError!ObjectCache {
         const maps = allocator.alloc(std.AutoHashMap(u64, CachedObj), pack_count) catch return error.OutOfMemory;
         for (maps) |*m| m.* = .init(allocator);
-        return .{ .maps = maps, .allocator = allocator };
+        return .{ .by_oid = .init(allocator), .by_offset = maps, .allocator = allocator };
     }
 
     pub fn deinit(self: *ObjectCache) void {
-        for (self.maps) |*m| {
-            var it = m.iterator();
-            while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+        var it = self.by_oid.iterator();
+        while (it.next()) |e| self.allocator.free(e.value_ptr.data);
+        self.by_oid.deinit();
+        for (self.by_offset) |*m| {
+            var mit = m.iterator();
+            while (mit.next()) |e| self.allocator.free(e.value_ptr.data);
             m.deinit();
         }
-        self.allocator.free(self.maps);
+        self.allocator.free(self.by_offset);
     }
 
-    pub fn get(self: *ObjectCache, pack_idx: usize, offset: u64) ?CachedObj {
-        return self.maps[pack_idx].get(offset);
+    pub fn getOid(self: *ObjectCache, oid: Oid) ?CachedObj {
+        return self.by_oid.get(oid.bytes);
     }
 
-    pub fn put(self: *ObjectCache, pack_idx: usize, offset: u64, obj: CachedObj) ZightError!void {
-        self.maps[pack_idx].put(offset, obj) catch return error.OutOfMemory;
+    pub fn putOid(self: *ObjectCache, oid: Oid, obj: CachedObj) ZightError!void {
+        self.by_oid.put(oid.bytes, obj) catch return error.OutOfMemory;
+    }
+
+    pub fn getOffset(self: *ObjectCache, pk_idx: usize, offset: u64) ?CachedObj {
+        return self.by_offset[pk_idx].get(offset);
+    }
+
+    pub fn putOffset(self: *ObjectCache, pk_idx: usize, offset: u64, obj: CachedObj) ZightError!void {
+        self.by_offset[pk_idx].put(offset, obj) catch return error.OutOfMemory;
     }
 };
 
-fn storeCached(c: *ObjectCache, pk_idx: usize, offset: u64, obj_type: ObjectType, data: []const u8) void {
+fn storeOid(c: *ObjectCache, oid: Oid, obj_type: ObjectType, data: []const u8) void {
     const dup = c.allocator.dupe(u8, data) catch return;
-    c.put(pk_idx, offset, .{ .type = obj_type, .data = dup }) catch {
+    c.putOid(oid, .{ .type = obj_type, .data = dup }) catch {
+        c.allocator.free(dup);
+    };
+}
+
+fn storeOffset(c: *ObjectCache, pk_idx: usize, offset: u64, obj_type: ObjectType, data: []const u8) void {
+    const dup = c.allocator.dupe(u8, data) catch return;
+    c.putOffset(pk_idx, offset, .{ .type = obj_type, .data = dup }) catch {
         c.allocator.free(dup);
     };
 }
@@ -119,23 +139,33 @@ pub const Reader = struct {
     }
 
     fn readObjectInternal(self: *Reader, allocator: Allocator, oid: Oid, depth: u32) ZightError!Object {
-        for (self.packs, 0..) |*pk, i| {
-            if (pk.findOffset(oid)) |offset| {
-                return self.resolvePackObject(allocator, i, offset, depth);
+        if (self.ocache) |c| {
+            if (c.getOid(oid)) |cached| {
+                const dup = allocator.dupe(u8, cached.data) catch return error.OutOfMemory;
+                return .{ .type = cached.type, .buf = dup, .content = dup };
             }
         }
 
-        return object.readLoose(self.repo, allocator, oid) catch |err| switch (err) {
-            error.NotFound => error.NotFound,
-            else => |e| e,
+        for (self.packs, 0..) |*pk, i| {
+            if (pk.findOffset(oid)) |offset| {
+                return self.resolvePackObject(allocator, oid, i, offset, depth);
+            }
+        }
+
+        const obj = object.readLoose(self.repo, allocator, oid) catch |err| switch (err) {
+            error.NotFound => return error.NotFound,
+            else => |e| return e,
         };
+        if (self.ocache) |c| storeOid(c, oid, obj.type, obj.content);
+        return obj;
     }
 
-    fn resolvePackObject(self: *Reader, allocator: Allocator, pk_idx: usize, offset: u64, depth: u32) ZightError!Object {
+    /// `oid` 非 null 时为顶层读取，存 `by_oid`；为 null 时为 delta 链中间对象，存 `by_offset`。
+    fn resolvePackObject(self: *Reader, allocator: Allocator, oid: ?Oid, pk_idx: usize, offset: u64, depth: u32) ZightError!Object {
         const pk = &self.packs[pk_idx];
 
         if (self.ocache) |c| {
-            if (c.get(pk_idx, offset)) |cached| {
+            if (c.getOffset(pk_idx, offset)) |cached| {
                 const dup = allocator.dupe(u8, cached.data) catch return error.OutOfMemory;
                 return .{ .type = cached.type, .buf = dup, .content = dup };
             }
@@ -153,9 +183,8 @@ pub const Reader = struct {
                 .tag => .tag,
                 else => unreachable, // isDelta 已过滤 ofs_delta/ref_delta
             };
-            if (self.ocache) |c| {
-                storeCached(c, pk_idx, offset, obj_type, raw.data);
-            }
+            if (self.ocache) |c| storeOffset(c, pk_idx, offset, obj_type, raw.data);
+            if (oid) |o| if (self.ocache) |c| storeOid(c, o, obj_type, raw.data);
             return .{
                 .type = obj_type,
                 .buf = raw.data,
@@ -166,7 +195,7 @@ pub const Reader = struct {
         defer allocator.free(raw.data);
 
         var base_obj: Object = if (raw.base_offset) |bo|
-            try self.resolvePackObject(allocator, pk_idx, bo, depth + 1)
+            try self.resolvePackObject(allocator, null, pk_idx, bo, depth + 1)
         else if (raw.base_oid) |boid|
             try self.readObjectInternal(allocator, boid, depth + 1)
         else
@@ -185,9 +214,8 @@ pub const Reader = struct {
             error.DeltaSizeMismatch => error.CorruptedObject,
         };
 
-        if (self.ocache) |c| {
-            storeCached(c, pk_idx, offset, base_obj.type, target);
-        }
+        if (self.ocache) |c| storeOffset(c, pk_idx, offset, base_obj.type, target);
+        if (oid) |o| if (self.ocache) |c| storeOid(c, o, base_obj.type, target);
 
         return .{
             .type = base_obj.type,
